@@ -45,6 +45,11 @@ def strip_fence(txt: str) -> str:
         txt = txt.split("\n", 1)[1].rsplit("```", 1)[0]
     return txt.strip()
 
+# --- health check ---
+@app.route('/healthz')
+def healthz():
+    return "ok", 200
+
 # ---------- main endpoint ----------
 @app.route("/match", methods=["POST"])
 def match():

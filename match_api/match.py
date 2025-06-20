@@ -5,7 +5,7 @@ from googleapiclient.discovery import build
 import google.auth, google.generativeai as genai
 import numpy as np
 
-SPREADSHEET_ID = os.environ['SPREADSHEET_ID']
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 SCOPES  = ['https://www.googleapis.com/auth/spreadsheets.readonly']
 creds,_ = google.auth.default(scopes=SCOPES)
 sheets  = build('sheets','v4',credentials=creds)

@@ -24,6 +24,7 @@ app = Flask(__name__)
 def load_jobs():
     vals = sheets.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID, range='Job_Database!A:K').execute().get('values',[])
+    vals = vals[:101]  # ← テスト用に先頭100件に制限
     return [dict(id=r[0], company=r[1], title=r[2], status=r[3],
                  summary=r[4], loc=r[5], salary=r[6]) for r in vals[1:] if r[3]=='募集中']
 

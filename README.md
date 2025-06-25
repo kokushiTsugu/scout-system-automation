@@ -1,162 +1,130 @@
 # Scout System Automation
 
-> **Purpose** – Fully automate the scouting workflow in recruitment: **(1)** extract structured data from job‑post PDFs, **(2)** maintain a clean master DB in Google Sheets, **(3)** auto‑match candidates & draft outreach messages with Gemini.
+> **Purpose** – Automate *every* step of our scouting pipeline  
+> **①** PDF job-post intake → **②** clean master DB on Google Sheets → **③** AI-driven matching & personalised outreach.
 
 ---
 
-## 1  End‑to‑End Flow
+## 1  High-Level Architecture
 
 ```text
-┌────────┐      (A)           ┌────────────┐  Eventarc  ┌─────────────┐
-│Recruiter│───upload PDF───▶│GDrive Folder│──────────▶│GCS Bucket   │
-└────────┘                   │“jobs‑inbox”│             │pdf‑intake   │
-                                                   (B) Cloud Events
-                                                        │
-                                                        ▼
-                                             Cloud Run  service
-                                             “my‑first‑function”
-                                                        │ Sheets API
-                                                        ▼
-                                          Google Sheet 〈Job_Database〉
-```
+           ┌────────┐ ①Upload PDF   ┌──────────────────────┐
+           │Recruiter│─────────────▶│Shared Drive “jobs-inbox│
+           └────────┘               └─────────┬────────────┘
+                             (A) Apps Script   │ copy
+                                               ▼
+           ┌──────────────────────────────────────────────┐
+           │   GCS bucket  gs://scout-system-pdf-intake-* │
+           └───────────────▲──────────────────────────────┘
+                           │ (B) Cloud Events
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│   Cloud Run : **pdf_ingest**                                   │
+│   • downloads PDF                                              │
+│   • extracts fields via Gemini 1.5 Flash                       │
+│   • upserts row in Sheet 〈Job_Database〉                       │
+└─────────────────────────────────────────────────────────────────┘
 
-(A) Drive upload GN drives Apps Script ⭢ copies file to the GCS bucket.
-(B) Bucket **finalize** event triggers *my‑first‑function* which
+┌─────────────── Google Sheet ───────────────┐
+│ Sheet1: 〈Job_Database〉                    │◀─ (C) Sheets API
+│ Sheet2: 〈Candidate_Pipeline〉              │
+│ Sheet3: 〈Interview_Notes〉 …              │
+└────────────────────────────────────────────┘
+          ▲              ▲
+          │ GAS (D)      │ GAS (E)
+          │              │
+┌────────────────────────────┐  ┌────────────────────────────┐
+│ Apps Script **Auto-Upload**│  │ Apps Script **Matching&Scout│
+│ • polls Drive → copies PDF │  │ • runBatchScoutMatching()   │
+│   to intake bucket         │  │ • runAdvancedMatching()     │
+└────────────────────────────┘  └────────────────────────────┘
 
-1. downloads the PDF
-2. sends it to **Gemini 1.5 Flash** with `prompt-job-extract.txt`
-3. upserts a row in **Job\_Database** (duplicate key = company×position).
+(A) Auto-Upload Apps Script copies each new PDF from Drive → GCS
+(B) Object finalize event triggers Cloud Run pdf_ingest
+(C) pdf_ingest updates Job_Database with parsed fields
+(D)(E) Spreadsheet-bound Apps Scripts call Cloud Run match_api to rank jobs & draft outreach copy with Gemini
 
----
+# 2 Repository Layout
+| Path / Dir                   | Purpose (who runs it)                                              |
+| ---------------------------- | ------------------------------------------------------------------ |
+| **`match_api/`**             | Flask + Gunicorn service → `/match`  (Cloud Run **match-service**) |
+| **`pdf_ingest/`**            | Fast Function for GCS events       (Cloud Run **pdf-ingest**)      |
+| **`apps_script/`**           | GAS **Auto-Upload-to-Google Cloud** (Drive-bound)                  |
+| **`gas_matching/`**          | GAS **マッチング＆スカウト**           (Sheet-bound)                         |
+| `README.md`                  | ← you’re reading                                                   |
+| infra helpers (.gitignore …) | Procfile, requirements, etc.                                       |
 
-## 2  Repository Layout (this repo)
+apps_script/ と gas_matching/ は clasp clone したまま置いているので
+ローカル編集 → clasp push で即 Spreadsheet/Drive に反映できます。
 
-| Path                     | Role                                                                   |
-| ------------------------ | ---------------------------------------------------------------------- |
-| `main.py`                | Cloud Run entrypoint (`process_storage_event`)                         |
-| `requirements.txt`       | pinned deps inc. `functions‑framework`                                 |
-| `Procfile`               | `web: functions-framework --target process_storage_event --port $PORT` |
-| `.gitignore`             | ignore build artefacts & local logs                                    |
-| `prompt-job-extract.txt` | extraction prompt (stored in `gs://scout-system-config`)               |
+# 3 Cloud Resources
+| Type            | Name / ID                               | Notes                    |
+| --------------- | --------------------------------------- | ------------------------ |
+| **Project**     | `scout-system-automation`               |                          |
+| **Bucket**      | `scout-system-pdf-intake-*`             | PDF intake               |
+| **Bucket**      | `scout-system-config`                   | prompt txt 等             |
+| **Cloud Run**   | `pdf-ingest`                            | 512 MiB / concurrency 1  |
+| **Cloud Run**   | `match-service`                         | 512 MiB / concurrency 10 |
+| **Apps Script** | *Auto-Upload-to-Google Cloud*           | Drive フォルダに紐付き           |
+| **Apps Script** | *マッチング＆スカウト*                            | Sheet に紐付き               |
+| **Sheet**       | *Job\_Database* / *Candidate\_Pipeline* | master DB                |
+| **SA**          | `pdf-processor-bot@`                    | Cloud Run 実行 & GCS read  |
+| **Trigger**     | Eventarc (GCS finalize → pdf\_ingest)   |                          |
+| **Build**       | GitHub push → Cloud Build               | Docker build & deploy    |
 
-> **Tip**  Keep all infra code here; Drive Apps Script lives in the “jobs‑inbox” folder itself.
+# 4 4 Development Cycle (Python services)
+# edit
+vim match_api/main.py
 
----
+# tests
+pytest
 
-## 3  Cloud Resources
-
-| Resource            | Name / ID                                                        | Notes                                 |
-| ------------------- | ---------------------------------------------------------------- | ------------------------------------- |
-| **Project**         | `scout-system-automation`                                        |                                       |
-| **Bucket**          | `scout-system-pdf-intake-YYYYMMDD`                               | Event source                          |
-| **Bucket**          | `scout-system-config`                                            | stores prompt text, etc.              |
-| **Cloud Run**       | `my-first-function`                                              | 1 GiB, concurrency 1                  |
-| **Apps Script**     | `Drive → GCS uploader`                                           | runs in jobs‑inbox folder             |
-| **Sheet**           | `14zSdCGQ9OnPzdiMOjZzQeAYj259JyB5Jk_I19EAG4Y8` / *Job\_Database* |                                       |
-| **Service Account** | `pdf-processor-bot@`                                             | Cloud Run exec & GCS read             |
-| **Trigger**         | Eventarc → Cloud Run                                             | GCS finalize event                    |
-| **Build trigger**   | *pending*                                                        | GitHub push → Cloud Build → Cloud Run |
-
----
-
-## 4  Local Development Cycle
-
-```bash
-# edit code
-vim main.py
-
-# run unit tests (if any)
-python -m pytest
+# local run
+uvicorn match_api.main:app --reload
 
 # commit & push
-git add main.py requirements.txt
-git commit -m "feat: xxx"
-git push origin main   # Cloud Build trigger deploys automatically
-```
+git add match_api/*
+git commit -m "feat(match): better scoring"
+git push origin main   # Cloud Build auto-deploys
 
-Manual deploy (fallback):
+## Manual deploy (fallback)
+gcloud run deploy match-service \
+  --source=match_api \
+  --region=asia-northeast1 \
+  --memory=512Mi --timeout=300
 
-```bash
-gcloud run deploy my-first-function \
-  --source=. --region=asia-northeast1 \
-  --memory=1Gi --concurrency=1 --timeout=360s
-```
+# 5 Secrets / Config
+| Name               | Used in              | Hint                            |
+| ------------------ | -------------------- | ------------------------------- |
+| `PROMPT_GCS_PATH`  | `pdf_ingest/main.py` | path to prompt in config bucket |
+| `SPREADSHEET_ID`   | Cloud Run vars       | Job\_Database sheet ID          |
+| Gemini server auth | workload identity    | no API key needed               |
+| `GEMINI_API_KEY`   | GAS Script Property  | set once via editor             |
 
----
+# 6 Smoke Test
+1. Upload sample.pdf to Drive folder jobs-inbox.
+2. Confirm row appears in Job_Database.
+3. Spreadsheet → スカウト補助 → 未処理の候補者を一括処理 実行。
+4. Subject / body / job picks が自動生成される。
 
-## 5  Environment / Secrets
+# 7 Ops & Monitoring
+- Cloud Run logs – pdf_ingest prints [Start] / [Append] / [Error]
+- Cloud Build logs – push builds both services
+- GAS logs – Stackdriver; use console.log()
+- Alerting – Log-based: severity≥ERROR ・ build FAILURE
+- Rollback – Cloud Run keeps last 100 revisions; GAS keeps versions
 
-| Variable          | Where set          | Description                                  |
-| ----------------- | ------------------ | -------------------------------------------- |
-| `PROMPT_GCS_PATH` | `main.py` const    | `scout-system-config/prompt-job-extract.txt` |
-| `SPREADSHEET_ID`  | `main.py` const    | target Google Sheet                          |
-| **Gemini auth**   | Cloud Run SA + IAM | uses workload identity (no API key)          |
+# 8 Troubleshooting Cheatsheet
+| Symptom                            | Likely Cause / Fix                            |
+| ---------------------------------- | --------------------------------------------- |
+| `Revision failed to start`         | wrong PORT / Procfile → check gunicorn config |
+| `403 storage.objects.create` (GAS) | SA lacks *Storage Object Creator* role        |
+| Duplicate rows in Sheet            | key normalisation bug                         |
+| Gemini timeout                     | increase Cloud Run `--timeout` or add retries |
 
-> For extra security move those consts to **Cloud Run → Variables & Secrets**.
+# 9 Contributing
+1. Branch off main (feat/, fix/, chore/).
+2. Use Conventional Commits (feat(match): …).
+3. PR → GitHub Actions runs lint + tests.
+4. Keep docs & README current.
 
----
-
-## 6  Smoke Test
-
-### Upload via Drive
-
-1. Place a PDF in the shared Drive folder **jobs‑inbox**.
-2. Wait ↪ Apps Script copies PDF to the GCS bucket.
-
-### Upload via CLI (direct to bucket)
-
-```bash
-PDF=sample.pdf
-BUCKET=scout-system-pdf-intake-20250617
-
-gsutil cp "$PDF" gs://$BUCKET/
-```
-
-### Verify
-
-```bash
-# Tail Cloud Run logs
-gcloud beta run services logs tail my-first-function --region=asia-northeast1
-```
-
-You should see:
-
-```
-[Start] sample.pdf
-[Append] id=123 Software Engineer (Tokyo)
-```
-
-and the new row appears in **Job\_Database**.
-
----
-
-## 7  Operations & Monitoring
-
-* **Cloud Run logs** – main.py prints `[Start] / [Append] / [Update] / [Error]` markers.
-* **Cloud Build logs** – each push builds; failures email owners.
-* **Alerting** – create Log‑based alert: severity≥ERROR or GCS upload 5xx.
-* **Rollbacks** – Cloud Run keeps last 100 revisions; UI → “Manage traffic”.
-
----
-
-## 8  Troubleshooting Cheatsheet
-
-| Symptom                       | Likely cause                                 | Fix                                       |
-| ----------------------------- | -------------------------------------------- | ----------------------------------------- |
-| `Revision failed to start`    | Procfile / PORT                              | Ensure `web:` entry & functions‑framework |
-| `403 Insufficient Permission` | Apps Script SA lacks `storage.objectCreator` | IAM → bucket role                         |
-| Duplicate rows                | canon() mismatch                             | adjust normalisation rules                |
-| Timeout from Gemini           | increase `--timeout`, add retry logic        |                                           |
-
----
-
-## 9  Contributing
-
-1. Fork & branch off `main`.
-2. Follow commit lint (`feat|fix|chore: ...`).
-3. PR → GitHub Actions runs lint/tests.
-4. Write good docs & keep README updated.
-
----
-
-© 2025 Tsugu Inc. – Maintained by *kokushi @ tsugu.io* & *k.nagase @ tsugu.io*

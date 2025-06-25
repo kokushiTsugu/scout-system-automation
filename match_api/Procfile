@@ -1,2 +1,1 @@
-web: gunicorn -c gunicorn.conf.py
-
+web: gunicorn -b :$PORT match_api.main:app

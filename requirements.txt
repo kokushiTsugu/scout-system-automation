@@ -1,0 +1,5 @@
+-r match_api/requirements.txt
+-r pdf_ingest/requirements.txt
+
+-e ./match_api
+-e ./pdf_ingest

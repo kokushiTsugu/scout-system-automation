@@ -1,5 +1,4 @@
 -r match_api/requirements.txt
--r pdf_ingest/requirements.txt
 
+# match_api をパッケージとしてインストール
 -e ./match_api
--e ./pdf_ingest

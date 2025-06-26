@@ -38,3 +38,4 @@ function uploadToGCS_(file) {
   
   Logger.log(`Upload ${file.getName()} → ${resp.getResponseCode()}`);
 }
+

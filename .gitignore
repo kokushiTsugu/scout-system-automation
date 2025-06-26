@@ -198,3 +198,5 @@ cython_debug/
 gas/**/oauth_client.json
 gas/**/.claspignore
 gas/**/node_modules/
+main
+oauth_client.json

@@ -73,20 +73,20 @@ ${p.appeal_points.map(pt => `　${pt}`).join('\n')}`
       // ❷ intro / closing 内の実名を {姓} へ強制置換
       const safeIntro   = data.intro_sentence.replaceAll(lastName, '{姓}');
       const safeClosing = data.closing_sentence.replaceAll(lastName, '{姓}');
-      
+
       /* 3-4. 本文生成 (目標スタイルに変更) */
       const body =
 `{姓} 様
 
 はじめまして。ハイクラス転職支援の TSUGU ${YOUR_NAME}と申します。
 
-${data.intro_sentence}
+${safeIntro}
 
 ▼ご紹介可能な案件例
 ────────────────────────
 ${positionsForBody}
 
-${data.closing_sentence}
+${safeClosing}
 
 ご興味ございましたら、弊社 COO ${COO_NAME} より 20〜30 分で
 ポジション詳細と市場動向をご説明いたします。

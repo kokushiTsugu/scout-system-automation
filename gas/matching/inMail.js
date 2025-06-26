@@ -61,14 +61,19 @@ function runBatchScoutMatching() {
       const aiText  = callGemini(prompt);
       const data    = JSON.parse(aiText);
 
-      /* 3-3. ポジションブロック整形 (目標スタイルに変更) */
+      /* 3-3. 本文パーツ整形 & 生成 */
+
+      // ❶ ポジションブロック
       const positionsForBody = data.positions
-        .map(p =>
-`◆ ${p.company_desc}
+        .map(p => `◆ ${p.company_desc}
 　${p.title}（年収 ${p.salary}）
 ${p.appeal_points.map(pt => `　${pt}`).join('\n')}`
         ).join('\n\n');
 
+      // ❷ intro / closing 内の実名を {姓} へ強制置換
+      const safeIntro   = data.intro_sentence.replaceAll(lastName, '{姓}');
+      const safeClosing = data.closing_sentence.replaceAll(lastName, '{姓}');
+      
       /* 3-4. 本文生成 (目標スタイルに変更) */
       const body =
 `{姓} 様

@@ -55,9 +55,9 @@ function runBatchScoutMatching() {
       const profile  = rows[i][1];
 
       // ★ 姓名の間のスペースで分割し、姓を取得
-      const lastName = fullName.split(/[\s　]/)[0];
+      const lastName = fullName.split(/[\\s　]/)[0]; // ← 変数は残してOK
 
-      const prompt  = buildPrompt(lastName, profile, JSON.stringify(jobJson, null, 2));
+      const prompt  = buildPrompt('{姓}', profile, JSON.stringify(jobJson, null, 2));
       const aiText  = callGemini(prompt);
       const data    = JSON.parse(aiText);
 

@@ -9,5 +9,6 @@ on:
 jobs:
   call-deploy:
     uses: ./.github/workflows/gas-deploy.yml
+    secrets: inherit              # ★ 追加
     with:
       dir: gas/uploader

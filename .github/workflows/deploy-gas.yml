@@ -1,0 +1,40 @@
+name: Deploy GAS (Auto-Upload)
+
+on:
+  push:
+    branches: [ "main" ]
+    paths: [ "apps_script/**" ]        # ← GAS ファイルを触ったときだけ発火
+jobs:
+  push-to-gas:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # clasp をセットアップ
+      - run: npm i -g @google/clasp@latest
+
+      # 認証ファイルを生成（Secrets から）
+      - name: Init .clasprc.json
+        run: |
+          cat > ~/.clasprc.json <<JSON
+          {
+            "token": {
+              "access_token": "",
+              "refresh_token": "${{ secrets.CLASP_REFRESH_TOKEN }}",
+              "scope": "https://www.googleapis.com/auth/script.projects https://www.googleapis.com/auth/script.deployments https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly https://www.googleapis.com/auth/service.management https://www.googleapis.com/auth/logging.read https://www.googleapis.com/auth/cloud-platform",
+              "token_type": "Bearer",
+              "expiry_date": 0
+            },
+            "oauth2ClientSettings": {
+              "clientId": "${{ secrets.CLASP_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.CLASP_CLIENT_SECRET }}",
+              "redirectUri": "http://localhost"
+            },
+            "isLocalCreds": false
+          }
+          JSON
+
+      # GAS フォルダへ移動して push
+      - name: clasp push
+        working-directory: apps_script       # ← rootDir が ./ の場合は .
+        run: clasp push --force

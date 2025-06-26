@@ -3,33 +3,22 @@ name: Reusable GAS Deploy
 on:
   workflow_call:
     inputs:
-      dir:                 # 例: gas/uploader
-        description: "Apps Script project directory"
+      dir:               # 例: gas/uploader
         required: true
         type: string
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-
     steps:
-      # 1) コード取得
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # 2) Node & clasp
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
-      - name: Install clasp
-        run: npm install -g @google/clasp
+      - run: npm install -g @google/clasp
 
-      # 3) 認証ファイルを生成
       - name: Authenticate clasp
         env:
           CLASP_CLIENT_ID:     ${{ secrets.CLASP_CLIENT_ID }}
@@ -38,18 +27,18 @@ jobs:
         run: |
           cat > ~/.clasprc.json <<EOF
           {
-            "tokens": {
-              "default": {
-                "client_id":     "${CLASP_CLIENT_ID}",
-                "client_secret": "${CLASP_CLIENT_SECRET}",
-                "refresh_token": "${CLASP_REFRESH_TOKEN}",
-                "type":          "authorized_user"
-              }
-            }
+            "token": {
+              "refresh_token": "${CLASP_REFRESH_TOKEN}"
+            },
+            "oauth2ClientSettings": {
+              "clientId":     "${CLASP_CLIENT_ID}",
+              "clientSecret": "${CLASP_CLIENT_SECRET}",
+              "redirectUri":  "http://localhost"
+            },
+            "isLocalCreds": false
           }
           EOF
 
-      # 4) GAS へデプロイ
       - name: Push to GAS
         run: |
           cd "${{ inputs.dir }}"

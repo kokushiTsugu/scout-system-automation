@@ -138,7 +138,7 @@ function buildPrompt(lastName, profile, jobListJson) {
         - **title**: 求人の役職名をそのまま記載。
         - **salary**: 求人票の給与情報を記載。
         - **appeal_points**: 候補者の経歴に響くような訴求ポイントを「2点」抽出する。箇条書きの「・」を文頭に付ける。
-    - **subject**: 「【限定スカウト】[No.1求人のcompany_desc]のポジションのご案内」という形式で作成する。
+    - **subject**: 「【限定スカウト】No.1求人のcompany_desc のポジションのご案内」という形式で作成する。
     - **intro_sentence**: 候補者の経歴から最も特筆すべき実績（在籍企業名＋具体的な役割）を引用し、「…してこられたご経歴に強く惹かれ、限定スカウトをお送りいたしました。」という自然で簡潔な一文を作成する。
     - **closing_sentence**: 「上記以外にも「広告×データ領域でのBizDev」「外資SaaSの日本ローンチ」など、{姓} 様のご志向に沿うポストを複数ご用意しています。」のように、紹介案件以外にも魅力的な選択肢があることを示唆する一文を作成する。
 
@@ -188,7 +188,7 @@ function buildPrompt(lastName, profile, jobListJson) {
 }
 
 # 候補者情報
-氏名: ${lastName} 様
+氏名: {姓} 様
 PROFILE:
 ${profile}
 

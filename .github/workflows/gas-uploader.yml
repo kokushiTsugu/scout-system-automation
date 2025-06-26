@@ -1,0 +1,13 @@
+name: GAS Deploy (Uploader)
+
+on:
+  push:
+    paths:
+      - 'gas/uploader/**'
+      - '.github/workflows/gas-uploader.yml'
+
+jobs:
+  call-deploy:
+    uses: ./.github/workflows/gas-deploy.yml
+    with:
+      dir: gas/uploader

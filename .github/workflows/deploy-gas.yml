@@ -3,20 +3,22 @@ name: Deploy GAS (Auto-Upload)
 on:
   push:
     branches: [ "main" ]
-    paths: [ "apps_script/**" ]        # ← GAS ファイルを触ったときだけ発火
+    paths:   [ "apps_script/**" ]   # GAS 触ったときだけ
+
 jobs:
   push-to-gas:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      # clasp をセットアップ
+      # clasp セットアップ
       - run: npm i -g @google/clasp@latest
 
-      # 認証ファイルを生成（Secrets から）
+      # 認証ファイル作成
       - name: Init .clasprc.json
         run: |
-          cat > ~/.clasprc.json <<JSON
+          cat > ~/.clasprc.json <<'JSON'
           {
             "token": {
               "access_token": "",
@@ -34,7 +36,7 @@ jobs:
           }
           JSON
 
-      # GAS フォルダへ移動して push
+      # GAS ディレクトリで deploy
       - name: clasp push
-        working-directory: apps_script       # ← rootDir が ./ の場合は .
+        working-directory: apps_script        # rootDir="./" なら apps_script
         run: clasp push --force

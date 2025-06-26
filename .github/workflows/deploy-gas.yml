@@ -1,42 +1,47 @@
 name: Deploy GAS (Auto-Upload)
 
+# ────────────────────── トリガ ──────────────────────
 on:
   push:
-    branches: [ "main" ]
-    paths:   [ "apps_script/**" ]   # GAS 触ったときだけ
+    branches: [ "main" ]          # main へ push されたら
+    paths:    [ "apps_script/**" ]# apps_script 配下に変更がある場合のみ
 
+# ───────────────────── ジョブ定義 ─────────────────────
 jobs:
   push-to-gas:
     runs-on: ubuntu-latest
 
     steps:
+      # 1) リポジトリ取得
       - uses: actions/checkout@v4
 
-      # clasp セットアップ
+      # 2) clasp インストール
       - run: npm i -g @google/clasp@latest
 
-      # 認証ファイル作成
+      # 3) ~/.clasprc.json を Secrets から動的生成
       - name: Init .clasprc.json
         run: |
-          cat > ~/.clasprc.json <<'JSON'
+          jq -n \
+            --arg id  "${{ secrets.CLASP_CLIENT_ID      }}" \
+            --arg sec "${{ secrets.CLASP_CLIENT_SECRET  }}" \
+            --arg ref "${{ secrets.CLASP_REFRESH_TOKEN  }}" '
           {
-            "token": {
-              "access_token": "",
-              "refresh_token": "${{ secrets.CLASP_REFRESH_TOKEN }}",
-              "scope": "https://www.googleapis.com/auth/script.projects https://www.googleapis.com/auth/script.deployments https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly https://www.googleapis.com/auth/service.management https://www.googleapis.com/auth/logging.read https://www.googleapis.com/auth/cloud-platform",
-              "token_type": "Bearer",
-              "expiry_date": 0
+            token:{
+              access_token:"",
+              refresh_token:$ref,
+              scope:"https://www.googleapis.com/auth/script.projects https://www.googleapis.com/auth/script.deployments https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly https://www.googleapis.com/auth/service.management https://www.googleapis.com/auth/logging.read https://www.googleapis.com/auth/cloud-platform",
+              token_type:"Bearer",
+              expiry_date:0
             },
-            "oauth2ClientSettings": {
-              "clientId": "${{ secrets.CLASP_CLIENT_ID }}",
-              "clientSecret": "${{ secrets.CLASP_CLIENT_SECRET }}",
-              "redirectUri": "http://localhost"
+            oauth2ClientSettings:{
+              clientId:$id,
+              clientSecret:$sec,
+              redirectUri:"http://localhost"
             },
-            "isLocalCreds": false
-          }
-          JSON
+            isLocalCreds:false
+          }' > ~/.clasprc.json
 
-      # GAS ディレクトリで deploy
+      # 4) GAS デプロイ
       - name: clasp push
-        working-directory: apps_script        # rootDir="./" なら apps_script
-        run: clasp push --force
+        working-directory: apps_script   # ルート dir ( .clasp.json / appsscript.json がある場所 )
+        run:  clasp push --force

@@ -1,13 +1,13 @@
-name: GAS Deploy (Uploader)
+name: GAS Deploy (Matching)
 
 on:
   push:
     paths:
-      - 'gas/uploader/**'
-      - '.github/workflows/gas-uploader.yml'
+      - 'gas/matching/**'
+      - '.github/workflows/gas-matching.yml'
 
 jobs:
   call-deploy:
     uses: ./.github/workflows/gas-deploy.yml
     with:
-      dir: gas/uploader
+      dir: gas/matching

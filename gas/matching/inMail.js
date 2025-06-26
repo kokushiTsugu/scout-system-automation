@@ -173,7 +173,7 @@ function buildPrompt(lastName, profile, jobListJson) {
   ],
   "subject": "【限定スカウト】グローバル Commerce Media プラットフォームのポジションのご案内",
   "intro_sentence": "Criteo と楽天の双方でエンタープライズ広告主を担当され、リテール／ブランド横断の運用・分析・提案をリードしてこられたご経歴に強く惹かれ、限定スカウトをお送りいたしました。",
-  "closing_sentence": "上記以外にも「広告×データ領域でのBizDev」「外資SaaSの日本ローンチ」など、Akutsu 様のご志向に沿うポストを複数ご用意しています。"
+  "closing_sentence": "上記以外にも「広告×データ領域でのBizDev」「外資SaaSの日本ローンチ」など、{姓} 様のご志向に沿うポストを複数ご用意しています。"
 }
 
 # JSON スキーマ (この形式で出力してください)

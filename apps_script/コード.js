@@ -1,3 +1,4 @@
+// test 2025-06-26_03:23:32
 const BUCKET      = 'scout-system-pdf-intake-20250617';
 const FOLDER_ID   = '1Qn6sJGsJVKhZdTGdPexieRELDJAkvdsf';     // jobs-inbox
 const PROP        = PropertiesService.getScriptProperties(); // 処理済み管理

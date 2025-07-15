@@ -1,52 +1,53 @@
 /* =====================================================================
- *  Friend_Request – v2025-07-15 REV-B
- *   • payload 上限対策 (22 KB)
- *   • Gemini プロンプトを明確化（改善点禁止・一方向）
+ * Friend_Request - v2025-07-15 (Standalone Fix)
+ * 役割：300文字以内の友達申請メッセージ生成（単体機能）
  * ===================================================================== */
 
-const SHEET_FR      = 'Friend_Request';
-const COL_NOTE_FR   = 4, COL_STAT_FR = 5, COL_RAW_FR = 6;
-const FR_BATCH_MAX  = 15;
+// ---- この機能で使う固定値 ----
+const SHEET_FR_ONLY     = 'Friend_Request';
+const COL_NOTE_FR_ONLY  = 4;
+const COL_STAT_FR_ONLY  = 5;
+const COL_RAW_FR_ONLY   = 6;
+const FR_BATCH_MAX_ONLY = 15;
 
-const MATCH_URL     = 'https://match-service-650488873290.asia-northeast1.run.app/match?mode=scout';
-const SA_EMAIL      = '650488873290-compute@developer.gserviceaccount.com';
+const MATCH_URL_FR_ONLY     = 'https://match-service-650488873290.asia-northeast1.run.app/match?mode=scout';
+const SA_EMAIL_FR_ONLY      = '650488873290-compute@developer.gserviceaccount.com';
 
-const BYTE_LIMIT    = 22000;    // 22 KB なら JSON 包含でも安全
-const RETRY_MAX     = 3;
+const BYTE_LIMIT_FR_ONLY    = 22000;
+const RETRY_MAX_FR_ONLY     = 3;
 
-/* ---- メイン ---- */
+
+/* ---- メイン処理 ---- */
 function runFriendRequest() {
-  const ui    = SpreadsheetApp.getUi();
-  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_FR);
-  if (!sheet) { ui.alert(`シート「${SHEET_FR}」が見つかりません`); return; }
+  const ui = SpreadsheetApp.getUi();
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_FR_ONLY);
+  if (!sheet) { ui.alert(`シート「${SHEET_FR_ONLY}」が見つかりません`); return; }
 
   const rows = sheet.getDataRange().getValues();
   let done = 0;
 
-  for (let i = 1; i < rows.length && done < FR_BATCH_MAX; i++) {
-    if (rows[i][COL_STAT_FR - 1]) continue;
-    const R    = i + 1;
-    const name = String(rows[i][0] || '').trim();     // フルネーム
+  for (let i = 1; i < rows.length && done < FR_BATCH_MAX_ONLY; i++) {
+    if (rows[i][COL_STAT_FR_ONLY - 1]) continue;
+    const R = i + 1;
+    const name = String(rows[i][0] || '').trim();
     const prof = String(rows[i][1] || '').trim();
 
     try {
-      sheet.getRange(R, COL_STAT_FR).setValue('処理中…');
+      sheet.getRange(R, COL_STAT_FR_ONLY).setValue('処理中…');
 
-      /* 1) Match */
-      const match = safeFetchMatch_(prof);
-      const top2  = (match.selected_positions || []).slice(0, 2);
+      const match = safeFetchMatch_FR_(prof);
+      const top2 = (match.selected_positions || []).slice(0, 2);
       if (!top2.length) throw new Error('適合求人なし');
 
-      /* 2) Gemini */
-      const note = callGemini_(buildFRPrompt_(name, top2));
+      // ★★★ 改善されたプロンプトを呼び出す ★★★
+      const note = callGemini_FR_(buildFRPrompt_FR_(name, top2));
 
-      /* 3) 書込 */
-      sheet.getRange(R, COL_NOTE_FR).setValue(note);
-      sheet.getRange(R, COL_RAW_FR ).setValue(JSON.stringify(match));
-      sheet.getRange(R, COL_STAT_FR).setValue('処理完了');
+      sheet.getRange(R, COL_NOTE_FR_ONLY).setValue(note);
+      sheet.getRange(R, COL_RAW_FR_ONLY).setValue(JSON.stringify(match));
+      sheet.getRange(R, COL_STAT_FR_ONLY).setValue('処理完了');
     } catch (e) {
-      sheet.getRange(R, COL_STAT_FR).setValue('エラー');
-      sheet.getRange(R, COL_RAW_FR ).setValue(String(e).slice(0, 300));
+      sheet.getRange(R, COL_STAT_FR_ONLY).setValue('エラー');
+      sheet.getRange(R, COL_RAW_FR_ONLY).setValue(String(e).slice(0, 300));
       console.warn(`FriendRequest row ${R}:`, e);
     }
     done++;
@@ -54,88 +55,100 @@ function runFriendRequest() {
   ui.alert(`${done} 名を処理しました`);
 }
 
-/* ---- サイズ制限 + リトライ ---- */
-function safeFetchMatch_(profileTxt) {
+/* ---- プロンプト生成（改善版） ---- */
+function buildFRPrompt_FR_(fullName, pos) {
+  const lastName = fullName.split(/[\s　]/).pop();          // ← #1
+  const p1 = pos[0];
+  const jobLine1 = `◆${p1.title}｜${p1.salary}`;
+  let jobLine2 = '';
+  if (pos[1]) {
+    const p2 = pos[1];
+    jobLine2 = `◆${p2.title}｜${p2.salary}`;
+  }
+  const jobsBlock = jobLine2 ? `${jobLine1}\n${jobLine2}` : jobLine1;  // ← #3
+  const calendlyUrl = 'https://calendly.com/k-nagase-tsugu/30min';
+
+  return `
+あなたは日本語ネイティブのハイクラスリクルーター。
+以下のフォーマットを**完全に再現**し、本文のみを300文字以内で出力せよ。
+追加説明・コードフェンスは禁止。文字数超過時は語尾を簡潔に切る。  <-- #2
+
+${lastName}様
+【国内トップ層向け案件紹介】
+ハイクラス向け人材紹介会社"TSUGU"代表の服部です。${lastName}様のご経歴を拝見し、ぜひご紹介したい求人がございます。
+
+―厳選求人例―
+${jobsBlock}
+
+いずれも裁量大きく、事業成長を牽引できるポジションです。
+※他100社以上の非公開求人もご紹介可能です。
+
+ご興味をお持ちいただけましたら、面談設定をお願いいたします！
+${calendlyUrl}
+`.trim();
+}
+
+
+/* ---- このファイル専用のヘルパー関数群 ---- */
+// 元のコードのロジックを維持し、このファイル内で完結させるための部品です。
+
+function safeFetchMatch_FR_(profileTxt) {
   let txt = profileTxt;
-  while (Utilities.newBlob(txt).getBytes().length > BYTE_LIMIT) {
+  while (Utilities.newBlob(txt).getBytes().length > BYTE_LIMIT_FR_ONLY) {
     txt = txt.slice(0, Math.floor(txt.length * 0.8));
   }
-
   const base = {
-    method:'post',
-    contentType:'application/json',
-    payload:JSON.stringify({candidate:{linkedin_profile:{text:txt}}})
+    method: 'post', contentType: 'application/json',
+    payload: JSON.stringify({ candidate: { linkedin_profile: { text: txt } } })
   };
-
-  for (let i=0;i<RETRY_MAX;i++){
-    const idTok = generateIdToken_(SA_EMAIL, MATCH_URL);
+  for (let i = 0; i < RETRY_MAX_FR_ONLY; i++) {
+    const idTok = generateIdToken_FR_(SA_EMAIL_FR_ONLY, MATCH_URL_FR_ONLY);
     try {
-      return fetchMatchApi(MATCH_URL, {...base, headers:{Authorization:`Bearer ${idTok}`}});
-    } catch (e){
-      if(i<RETRY_MAX-1 && (/rate limit|500/.test(e))) { Utilities.sleep(1500*(i+1)); continue; }
+      const res = UrlFetchApp.fetch(MATCH_URL_FR_ONLY, { ...base, headers: { Authorization: `Bearer ${idTok}` }, muteHttpExceptions: true });
+      if (res.getResponseCode() >= 400) throw new Error(`Match API Error: ${res.getContentText()}`);
+      return JSON.parse(res.getContentText());
+    } catch (e) {
+      if (i < RETRY_MAX_FR_ONLY - 1 && (/rate limit|500/.test(String(e)))) {
+        Utilities.sleep(1500 * (i + 1));
+        continue;
+      }
       throw e;
     }
   }
   throw new Error('Match API 再試行上限');
 }
 
-/* ---- ID-Token ---- */
-function generateIdToken_(sa, aud){
-  const url=`https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(sa)}:generateIdToken`;
-  const res=UrlFetchApp.fetch(url,{
-    method:'post',contentType:'application/json',
-    payload:JSON.stringify({audience:aud,includeEmail:true}),
-    headers:{Authorization:`Bearer ${ScriptApp.getOAuthToken()}`}
+function generateIdToken_FR_(sa, aud) {
+  const url = `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(sa)}:generateIdToken`;
+  const res = UrlFetchApp.fetch(url, {
+    method: 'post', contentType: 'application/json',
+    payload: JSON.stringify({ audience: aud, includeEmail: true }),
+    headers: { Authorization: `Bearer ${ScriptApp.getOAuthToken()}` }
   });
   return JSON.parse(res).token;
 }
 
-/* ---- Gemini Prompt (改善版 v2) ---- */
-function buildFRPrompt_(fullName, pos) {
-  // 名字（姓）を抽出するロジック
-  const lastName = fullName.split(/[\s　]/)[0] || fullName;
-  
-  // ★★★ 変更点(1): company_desc も取得する ★★★
-  const positionsData = pos.map(p => ({
-    desc: p.company_desc || '', // 会社概要
-    title: p.title || 'N/A',      // 役職名
-    salary: p.salary || ''       // 給与
-  }));
+function callGemini_FR_(prompt) {
+  const GEMINI_KEY_FR = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  const GEMINI_EP_FR  = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent';
 
-  const p1 = positionsData[0];
-  const p2 = positionsData[1];
-  
-  const calendlyUrl = 'https://calendly.com/k-nagase-tsugu/30min';
-
-  return `
-あなたは、指定されたフォーマットとルールを100%完璧に遵守する、プロのメッセージ作成アシスタントです。
-あなたの唯一のタスクは、以下の構成要素とフォーマット見本を使い、一つの完成されたメッセージテキストのみを出力することです。
-
-# 厳守すべきルール
-- **フォーマットの完全遵守**: 後述する「# 完成形フォーマット」を寸分違わず再現してください。改行の位置も同じです。
-- **文字数制限**: 全体の文字数を必ず300文字以内に収めてください。
-- **編集の禁止**: 提供された固定テキスト（自己紹介文など）を一切変更しないでください。
-- **出力**: 完成したメッセージ本文のみを出力し、説明や言い訳、コードフェンス(\`\`\`)は絶対に含めないでください。
-
-# 構成要素
-- **候補者の姓**: ${lastName}
-- **求人1**: ${p1.desc} ${p1.title}｜${p1.salary}
-- **求人2**: ${p2 ? `${p2.desc} ${p2.title}｜${p2.salary}` : ''}
-- **面談リンク**: ${calendlyUrl}
-
-# 完成形フォーマット (この形式を厳守)
-
-${lastName}様
-【国内トップ層向け案件紹介】
-ハイクラス向け人材紹介会社"TSUGU"代表の服部です。${lastName}様のこれまでのご経歴を拝見し、ぜひご紹介したい求人がございます。
-
-―厳選求人例―
-◆${p1.desc} ${p1.title}｜${p1.salary}
-◆${p2 ? `${p2.desc} ${p2.title}｜${p2.salary}` : ''}
-
-いずれも裁量大きく、事業成長を牽引できるポジションです。他にも100社以上の非公開求人を扱っております。
-
-ご興味があれば、面談をお願いいたします。
-${calendlyUrl}
-`.trim();
+  const resp = UrlFetchApp.fetch(`${GEMINI_EP_FR}?key=${GEMINI_KEY_FR}`, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.4 }
+    }),
+    muteHttpExceptions: true,
+  });
+  if (resp.getResponseCode() !== 200) {
+    throw new Error(`Gemini API Error: ${resp.getResponseCode()} ${resp.getContentText()}`);
+  }
+  const j = JSON.parse(resp.getContentText());
+  let out = j.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+  if (!out) throw new Error('Gemini応答が空');
+  if (out.startsWith('```')) {
+    out = out.replace(/^```[\s\S]*?\n/, '').replace(/```$/, '').trim();
+  }
+  return out;
 }

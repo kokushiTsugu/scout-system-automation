@@ -93,23 +93,21 @@ ${calendlyUrl}
 // 元のコードのロジックを維持し、このファイル内で完結させるための部品です。
 
 function safeFetchMatch_FR_(profileTxt) {
-  /** ① JSON 包装した時点で 35 000 bytes 未満になるよう調整 */
+  /* ① ラップ後の bytes を計測して 32 kB 未満になるまで縮める */
+  const wrap = t => JSON.stringify({ candidate: { linkedin_profile: { text: t } } });
   let txt = profileTxt;
-  const wrap = obj => JSON.stringify({ candidate: { linkedin_profile: { text: obj } } });
-
-  while (Utilities.newBlob(wrap(txt)).getBytes().length > 35000) {
-    // 文字数 70 % に短縮しながら再計測
-    txt = txt.slice(0, Math.floor(txt.length * 0.7));
+  while (Utilities.newBlob(wrap(txt)).getBytes().length > 32000) {
+    txt = txt.slice(0, Math.floor(txt.length * 0.6));   // 40 % カット
   }
 
-  /** ② 共通オプション */
+  /* ② 共通オプション */
   const base = {
     method: 'post',
     contentType: 'application/json',
     payload: wrap(txt)
   };
 
-  /** ③ リトライ付き呼び出し */
+  /* ③ 3 回リトライ (rate-limit / 500 のみ) */
   for (let i = 0; i < RETRY_MAX_FR_ONLY; i++) {
     const idTok = generateIdToken_FR_(SA_EMAIL_FR_ONLY, MATCH_URL_FR_ONLY);
     try {
@@ -131,6 +129,7 @@ function safeFetchMatch_FR_(profileTxt) {
   }
   throw new Error('Match API 再試行上限');
 }
+
 
 function generateIdToken_FR_(sa, aud) {
   const url = `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(sa)}:generateIdToken`;

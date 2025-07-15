@@ -1,6 +1,7 @@
 /* =====================================================================
- *  Friend_Request – profile payload trimming + rate-limit retry
- *  v2025-07-15
+ *  Friend_Request – v2025-07-15 REV-B
+ *   • payload 上限対策 (22 KB)
+ *   • Gemini プロンプトを明確化（改善点禁止・一方向）
  * ===================================================================== */
 
 const SHEET_FR      = 'Friend_Request';
@@ -10,10 +11,10 @@ const FR_BATCH_MAX  = 15;
 const MATCH_URL     = 'https://match-service-650488873290.asia-northeast1.run.app/match?mode=scout';
 const SA_EMAIL      = '650488873290-compute@developer.gserviceaccount.com';
 
-const BYTE_LIMIT    = 30000;   // 30 KB 安全圏
-const RETRY_MAX     = 3;       // rate-limit 時の再試行回数
+const BYTE_LIMIT    = 22000;    // 22 KB なら JSON 包含でも安全
+const RETRY_MAX     = 3;
 
-/* ---- Friend Request メイン ---- */
+/* ---- メイン ---- */
 function runFriendRequest() {
   const ui    = SpreadsheetApp.getUi();
   const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_FR);
@@ -23,23 +24,23 @@ function runFriendRequest() {
   let done = 0;
 
   for (let i = 1; i < rows.length && done < FR_BATCH_MAX; i++) {
-    if (rows[i][COL_STAT_FR - 1]) continue;           // 既に処理済み
-    const R   = i + 1;
-    const name= String(rows[i][0] || '').trim();
-    const prof= String(rows[i][1] || '').trim();
+    if (rows[i][COL_STAT_FR - 1]) continue;
+    const R    = i + 1;
+    const name = String(rows[i][0] || '').trim();     // フルネーム
+    const prof = String(rows[i][1] || '').trim();
 
     try {
       sheet.getRange(R, COL_STAT_FR).setValue('処理中…');
 
-      /* 1) Match-API 取得 */
+      /* 1) Match */
       const match = safeFetchMatch_(prof);
       const top2  = (match.selected_positions || []).slice(0, 2);
-      if (!top2.length) throw new Error('適合求人が見つかりません');
+      if (!top2.length) throw new Error('適合求人なし');
 
-      /* 2) Gemini で 300 字メッセージ */
+      /* 2) Gemini */
       const note = callGemini_(buildFRPrompt_(name, top2));
 
-      /* 3) シート書込 */
+      /* 3) 書込 */
       sheet.getRange(R, COL_NOTE_FR).setValue(note);
       sheet.getRange(R, COL_RAW_FR ).setValue(JSON.stringify(match));
       sheet.getRange(R, COL_STAT_FR).setValue('処理完了');
@@ -53,70 +54,88 @@ function runFriendRequest() {
   ui.alert(`${done} 名を処理しました`);
 }
 
-/* ---- 安全 fetch (サイズ制限 + レートリミット再試行) ---- */
+/* ---- サイズ制限 + リトライ ---- */
 function safeFetchMatch_(profileTxt) {
-  // ① 30 KB でバイト長カット
-  let clean = profileTxt;
-  while (Utilities.newBlob(clean).getBytes().length > BYTE_LIMIT) {
-    clean = clean.slice(0, Math.floor(clean.length * 0.8));  // 20%ずつ削る
+  let txt = profileTxt;
+  while (Utilities.newBlob(txt).getBytes().length > BYTE_LIMIT) {
+    txt = txt.slice(0, Math.floor(txt.length * 0.8));
   }
 
-  // ② 共通オプション
-  const baseOpts = {
-    method      : 'post',
-    contentType : 'application/json',
-    payload     : JSON.stringify({ candidate: { linkedin_profile: { text: clean } } })
+  const base = {
+    method:'post',
+    contentType:'application/json',
+    payload:JSON.stringify({candidate:{linkedin_profile:{text:txt}}})
   };
 
-  // ③ リトライ付き呼び出し
-  for (let i = 0; i < RETRY_MAX; i++) {
+  for (let i=0;i<RETRY_MAX;i++){
     const idTok = generateIdToken_(SA_EMAIL, MATCH_URL);
     try {
-      return fetchMatchApi(MATCH_URL, { ...baseOpts, headers: { Authorization: `Bearer ${idTok}` } });
-    } catch (e) {
-      // rate-limit / 500 は再試行、他は即 throw
-      if (i < RETRY_MAX - 1 && /rate limit|500/.test(e)) {
-        Utilities.sleep(1500 * (i + 1));
-        continue;
-      }
+      return fetchMatchApi(MATCH_URL, {...base, headers:{Authorization:`Bearer ${idTok}`}});
+    } catch (e){
+      if(i<RETRY_MAX-1 && (/rate limit|500/.test(e))) { Utilities.sleep(1500*(i+1)); continue; }
       throw e;
     }
   }
-  throw new Error(`Match API failed after ${RETRY_MAX} retries`);
+  throw new Error('Match API 再試行上限');
 }
 
-/* ---- SA で ID-Token 取得 ---- */
-function generateIdToken_(saEmail, aud) {
-  const url = `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(saEmail)}:generateIdToken`;
-  const res = UrlFetchApp.fetch(url, {
-    method      : 'post',
-    contentType : 'application/json',
-    payload     : JSON.stringify({ audience: aud, includeEmail: true }),
-    headers     : { Authorization: `Bearer ${ScriptApp.getOAuthToken()}` }
+/* ---- ID-Token ---- */
+function generateIdToken_(sa, aud){
+  const url=`https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(sa)}:generateIdToken`;
+  const res=UrlFetchApp.fetch(url,{
+    method:'post',contentType:'application/json',
+    payload:JSON.stringify({audience:aud,includeEmail:true}),
+    headers:{Authorization:`Bearer ${ScriptApp.getOAuthToken()}`}
   });
   return JSON.parse(res).token;
 }
 
-/* ---- Prompt Builder (変化なし) ---- */
+/* ---- Gemini Prompt (改善版 v2) ---- */
 function buildFRPrompt_(fullName, pos) {
-  const last = fullName.split(/[\s　]/)[0] || '';
-  const p1   = pos[0];
-  const p2   = pos[1] || { title: '', salary: '' };
+  // 名字（姓）を抽出するロジック
+  const lastName = fullName.split(/[\s　]/)[0] || fullName;
+  
+  // ★★★ 変更点(1): company_desc も取得する ★★★
+  const positionsData = pos.map(p => ({
+    desc: p.company_desc || '', // 会社概要
+    title: p.title || 'N/A',      // 役職名
+    salary: p.salary || ''       // 給与
+  }));
+
+  const p1 = positionsData[0];
+  const p2 = positionsData[1];
+  
+  const calendlyUrl = 'https://calendly.com/k-nagase-tsugu/30min';
 
   return `
-${last}様
+あなたは、指定されたフォーマットとルールを100%完璧に遵守する、プロのメッセージ作成アシスタントです。
+あなたの唯一のタスクは、以下の構成要素とフォーマット見本を使い、一つの完成されたメッセージテキストのみを出力することです。
+
+# 厳守すべきルール
+- **フォーマットの完全遵守**: 後述する「# 完成形フォーマット」を寸分違わず再現してください。改行の位置も同じです。
+- **文字数制限**: 全体の文字数を必ず300文字以内に収めてください。
+- **編集の禁止**: 提供された固定テキスト（自己紹介文など）を一切変更しないでください。
+- **出力**: 完成したメッセージ本文のみを出力し、説明や言い訳、コードフェンス(\`\`\`)は絶対に含めないでください。
+
+# 構成要素
+- **候補者の姓**: ${lastName}
+- **求人1**: ${p1.desc} ${p1.title}｜${p1.salary}
+- **求人2**: ${p2 ? `${p2.desc} ${p2.title}｜${p2.salary}` : ''}
+- **面談リンク**: ${calendlyUrl}
+
+# 完成形フォーマット (この形式を厳守)
+
+${lastName}様
 【国内トップ層向け案件紹介】
-ハイクラス向け人材紹介会社"TSUGU"代表の服部です。
-これまでのご経歴を拝見し、ぜひご提案したい求人があり連絡いたしました！
+ハイクラス向け人材紹介会社"TSUGU"代表の服部です。${lastName}様のこれまでのご経歴を拝見し、ぜひご紹介したい求人がございます。
 
 ―厳選求人例―
-◆${p1.title}｜${p1.salary}
-◆${p2.title}｜${p2.salary}
+◆${p1.desc} ${p1.title}｜${p1.salary}
+◆${p2 ? `${p2.desc} ${p2.title}｜${p2.salary}` : ''}
 
-どちらも裁量大きく、事業成長を牽引できるポジションです。
-※他100社以上の非公開求人案内可能
+いずれも裁量大きく、事業成長を牽引できるポジションです。他にも100社以上の非公開求人を扱っております。
 
-興味をお持ちいただけましたら、面談設定をお願いします！
-${CALENDLY_URL}
+ご興味があれば、面談をお願いいたします。
+${calendlyUrl}
 `.trim();
 }

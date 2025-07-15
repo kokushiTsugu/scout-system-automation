@@ -93,22 +93,36 @@ ${calendlyUrl}
 // 元のコードのロジックを維持し、このファイル内で完結させるための部品です。
 
 function safeFetchMatch_FR_(profileTxt) {
+  /** ① JSON 包装した時点で 35 000 bytes 未満になるよう調整 */
   let txt = profileTxt;
-  while (Utilities.newBlob(txt).getBytes().length > BYTE_LIMIT_FR_ONLY) {
-    txt = txt.slice(0, Math.floor(txt.length * 0.8));
+  const wrap = obj => JSON.stringify({ candidate: { linkedin_profile: { text: obj } } });
+
+  while (Utilities.newBlob(wrap(txt)).getBytes().length > 35000) {
+    // 文字数 70 % に短縮しながら再計測
+    txt = txt.slice(0, Math.floor(txt.length * 0.7));
   }
+
+  /** ② 共通オプション */
   const base = {
-    method: 'post', contentType: 'application/json',
-    payload: JSON.stringify({ candidate: { linkedin_profile: { text: txt } } })
+    method: 'post',
+    contentType: 'application/json',
+    payload: wrap(txt)
   };
+
+  /** ③ リトライ付き呼び出し */
   for (let i = 0; i < RETRY_MAX_FR_ONLY; i++) {
     const idTok = generateIdToken_FR_(SA_EMAIL_FR_ONLY, MATCH_URL_FR_ONLY);
     try {
-      const res = UrlFetchApp.fetch(MATCH_URL_FR_ONLY, { ...base, headers: { Authorization: `Bearer ${idTok}` }, muteHttpExceptions: true });
-      if (res.getResponseCode() >= 400) throw new Error(`Match API Error: ${res.getContentText()}`);
+      const res = UrlFetchApp.fetch(
+        MATCH_URL_FR_ONLY,
+        { ...base, headers: { Authorization: `Bearer ${idTok}` }, muteHttpExceptions: true }
+      );
+      if (res.getResponseCode() >= 400) {
+        throw new Error(`Match API ${res.getResponseCode()}: ${res.getContentText().slice(0,120)}`);
+      }
       return JSON.parse(res.getContentText());
     } catch (e) {
-      if (i < RETRY_MAX_FR_ONLY - 1 && (/rate limit|500/.test(String(e)))) {
+      if (i < RETRY_MAX_FR_ONLY - 1 && /rate limit|500/.test(String(e))) {
         Utilities.sleep(1500 * (i + 1));
         continue;
       }

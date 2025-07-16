@@ -55,9 +55,14 @@ function runFriendRequest() {
   ui.alert(`${done} 名を処理しました`);
 }
 
-/* ---- プロンプト生成（改善版） ---- */
+/**
+ * 友達申請メッセージ用プロンプト生成（最終FIX版）
+ * GAS が組み立てた「部品」を指示どおり結合させるだけ
+ */
 function buildFRPrompt_FR_(fullName, pos) {
-  const lastName = fullName.split(/[\s　]/).pop();          // ← #1
+  const lastName = fullName.split(/[\s　]/).pop() || fullName;      // 姓を安全抽出
+
+  /* ── 部品を作る ── */
   const p1 = pos[0];
   const jobLine1 = `◆${p1.title}｜${p1.salary}`;
   let jobLine2 = '';
@@ -65,26 +70,43 @@ function buildFRPrompt_FR_(fullName, pos) {
     const p2 = pos[1];
     jobLine2 = `◆${p2.title}｜${p2.salary}`;
   }
-  const jobsBlock = jobLine2 ? `${jobLine1}\n${jobLine2}` : jobLine1;  // ← #3
   const calendlyUrl = 'https://calendly.com/k-nagase-tsugu/30min';
+  const intro = `ハイクラス向け人材紹介会社"TSUGU"代表の服部です。${lastName}様のご経歴を拝見し、ぜひご紹介したい求人がございます。`;
 
+  /* ── AI への手順書プロンプト ── */
   return `
-あなたは日本語ネイティブのハイクラスリクルーター。
-以下のフォーマットを**完全に再現**し、本文のみを300文字以内で出力せよ。
-追加説明・コードフェンスは禁止。文字数超過時は語尾を簡潔に切る。  <-- #2
+あなたは提供された「構成要素」を、以下の「組み立て手順」に 100% 従って結合するボットです。余計な語句は一切追加しません。
 
-${lastName}様
-【国内トップ層向け案件紹介】
-ハイクラス向け人材紹介会社"TSUGU"代表の服部です。${lastName}様のご経歴を拝見し、ぜひご紹介したい求人がございます。
+# 組み立て手順
+1.{greeting}
+2.{subject}
+3.{introduction}
+(空行)
+4.{job_section_header}
+5.{job_line_1}
+6.{job_line_2}
+(空行)
+7.{closing_line_1}
+8.{closing_line_2}
+(空行)
+9.{call_to_action}
+10.{link}
 
-―厳選求人例―
-${jobsBlock}
+# 構成要素
+{greeting}: "${lastName}様"
+{subject}: "【国内トップ層向け案件紹介】"
+{introduction}: "${intro}"
+{job_section_header}: "―厳選求人例―"
+{job_line_1}: "${jobLine1}"
+{job_line_2}: "${jobLine2}"
+{closing_line_1}: "いずれも裁量大きく、事業成長を牽引できるポジションです。"
+{closing_line_2}: "他にも100社以上の非公開求人を扱っております。"
+{call_to_action}: "ご興味あれば、面談をお願いいたします。"
+{link}: "${calendlyUrl}"
 
-いずれも裁量大きく、事業成長を牽引できるポジションです。
-※他100社以上の非公開求人もご紹介可能です。
-
-ご興味をお持ちいただけましたら、面談設定をお願いいたします！
-${calendlyUrl}
+# 絶対ルール
+- 手順・構成要素にない語句や記号、絵文字を追加しない。
+- 完成メッセージ本文だけを 300 文字以内で出力。説明・コードフェンス禁止。
 `.trim();
 }
 

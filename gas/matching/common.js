@@ -3,7 +3,7 @@
  * ===================================================================== */
 
 /* ==== 共通定数 ==== */
-const CALENDLY_URL = 'https://calendly.com/k-nagase-tsugu/30min';
+const CALENDLY_URL = 'https://calendly.com/k-nagase-tsugu/_linked-in-in-ma';
 const YOUR_NAME    = '服部';
 const YOUR_COMPANY = 'TSUGU';
 const COO_NAME     = '長瀬';

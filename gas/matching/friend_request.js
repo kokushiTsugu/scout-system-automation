@@ -70,7 +70,7 @@ function buildFRPrompt_FR_(fullName, pos) {
     const p2 = pos[1];
     jobLine2 = `◆${p2.title}｜${p2.salary}`;
   }
-  const calendlyUrl = 'https://calendly.com/k-nagase-tsugu/30min';
+  const calendlyUrl = 'https://calendly.com/k-nagase-tsugu/_linked-in-fr';
   const intro = `ハイクラス向け人材紹介会社"TSUGU"代表の服部です。${lastName}様のご経歴を拝見し、ぜひご紹介したい求人がございます。`;
 
   /* ── AI への手順書プロンプト ── */

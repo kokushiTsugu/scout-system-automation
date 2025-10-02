@@ -12,7 +12,7 @@ creds, _ = google.auth.default(scopes=SCOPES)
 sheets = build("sheets", "v4", credentials=creds)
 
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-flash = genai.GenerativeModel("gemini-1.5-flash")
+flash = genai.GenerativeModel("gemini-1.5-flash-latest")
 pro   = genai.GenerativeModel("gemini-1.5-pro")
 
 app = Flask(__name__)

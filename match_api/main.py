@@ -1,56 +1,110 @@
-# match.py  – 500 / OOM 対策 & Flash フォーマット耐性付き
-import os, json, functools
+# main.py – Cloud Run / Flask（生成もサーバ側に集約 / v1 + 2.5 系 / timeout & fallback）
+import os
+import re
+import json
+import time
+import functools
+from typing import List, Dict, Any
+
 from flask import Flask, request, jsonify
+
+# --- Google Sheets (timeout付きhttplib2で安定化) ---
+import google.auth
 from googleapiclient.discovery import build
-import google.auth, google.generativeai as genai
+import httplib2
+import google_auth_httplib2
+
+# --- Embedding: google-genai v1 client ---
+from google import genai as genai_v1
+
+# --- NumPy for similarity ---
 import numpy as np
 
-# ---------- env ----------
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+
+# =========================
+# Env / Clients
+# =========================
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 creds, _ = google.auth.default(scopes=SCOPES)
-sheets = build("sheets", "v4", credentials=creds)
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-flash = genai.GenerativeModel("gemini-1.5-flash-latest")
-pro   = genai.GenerativeModel("gemini-1.5-pro")
+# Sheets: per-request ではなく Http 生成時に timeout 指定
+_http = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=30))
+sheets = build("sheets", "v4", http=_http)
+
+# APIキーは GEMINI_API_KEY 優先、なければ GOOGLE_API_KEY
+_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
+CLIENT = genai_v1.Client(api_key=_API_KEY)
+
+# 生成モデル（既定は 2.5-flash。必要なら ENV で切替）
+MODEL_FLASH = os.getenv("MODEL_FLASH", "gemini-2.5-flash")
 
 app = Flask(__name__)
 
-# ---------- utils ----------
+
+# =========================
+# Utilities
+# =========================
 @functools.lru_cache
-def load_jobs():
+def load_jobs() -> List[Dict[str, Any]]:
     """Job_Database!A:K から最大 50 件だけ取得（メモリ節約）"""
-    vals = sheets.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID, range="Job_Database!A:K"
-    ).execute().get("values", [])
-    vals = vals[1:51]                     # ヘッダー除外 & 上限
+    vals = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=SPREADSHEET_ID, range="Job_Database!A:K")
+        .execute()
+        .get("values", [])
+    )
+    vals = vals[1:51]  # ヘッダー除外 & 上限
     return [
-        dict(id=r[0], company=r[1], title=r[2], status=r[3],
-             summary=r[4], loc=r[5], salary=r[6])
-        for r in vals if len(r) > 6 and r[3] == "募集中"
+        dict(
+            id=r[0],
+            company=r[1],
+            title=r[2],
+            status=r[3],
+            summary=r[4] if len(r) > 4 else "",
+            loc=r[5] if len(r) > 5 else "",
+            salary=r[6] if len(r) > 6 else "",
+        )
+        for r in vals
+        if len(r) > 6 and r[3] == "募集中"
     ]
+
 
 @functools.lru_cache(maxsize=1_024)
 def _embed_cached(text: str) -> tuple:
     """Embedding API（結果は tuple 化してキャッシュ）"""
-    vec = genai.embed_content(model="models/embedding-001", content=text)["embedding"]
+    vec = _embed_once(text)
     return tuple(vec)
+
 
 def embed(text: str) -> np.ndarray:
     return np.array(_embed_cached(text))
 
-def strip_fence(txt: str) -> str:
-    if txt.startswith("```"):
-        txt = txt.split("\n", 1)[1].rsplit("```", 1)[0]
-    return txt.strip()
 
-# --- health check ---
-@app.route('/healthz')
+def strip_fence(txt: str) -> str:
+    """``` で囲まれている場合に中身だけ取り出す"""
+    if txt is None:
+        return ""
+    s = txt.strip()
+    if s.startswith("```"):
+        s = s.split("```", 1)[1]
+        if "```" in s:
+            s = s.rsplit("```", 1)[0]
+    return s.strip()
+
+
+# =========================
+# Health
+# =========================
+@app.route("/healthz")
 def healthz():
     return "ok", 200
 
-# ---------- main endpoint ----------
+
+# =========================
+# Endpoints
+# =========================
 @app.route("/match", methods=["POST"])
 def match():
     mode = request.args.get("mode", "scout")
@@ -66,31 +120,34 @@ def match():
             result = proposal_flow(cand)
         else:
             return jsonify(error="mode must be scout|proposal"), 400
-        return jsonify(result)
+        return jsonify(result), 200
     except Exception as e:
-        # 500 の詳細をログに吐きつつ、ユーザーには簡潔に返す
         app.logger.exception("match() failed")
         return jsonify(error=str(e)), 500
 
-# ---------- flows ----------
-def scout_flow(cand):
+
+# =========================
+# Flows
+# =========================
+def scout_flow(cand: dict) -> Dict[str, Any]:
     jobs = load_jobs()
 
     # 1) embedding 類似度
-    c_vec = embed(json.dumps(cand.get("linkedin_profile", "")))
-    sims  = [(j, float(np.dot(c_vec, embed(j["summary"])))) for j in jobs]
+    c_src = cand.get("linkedin_profile", "")
+    c_vec = embed(json.dumps(c_src))
+    sims = [(j, float(np.dot(c_vec, embed(j["summary"])))) for j in jobs]
     top20 = sorted(sims, key=lambda x: -x[1])[:20]
 
-    # 2) Gemini Flash で 2 件 pick
+    # 2) 2.5 Flash で 2 件 pick（REST v1）
     prompt = f"""
-    下記候補者 LinkedIn と求人20件から、最もクリック率が高そうな2件だけ JSONで返して。
-    キーは id,title,company_desc,salary の4項目のみ。
-    ### CAND
-    {cand['linkedin_profile']}
-    ### JOBS
-    {json.dumps([j for j, _ in top20], ensure_ascii=False)}
-    """
-    txt = strip_fence(flash.generate_content(prompt).text)
+下記候補者 LinkedIn と求人20件から、最もクリック率が高そうな2件だけ JSONで返して。
+キーは id,title,company_desc,salary の4項目のみ。
+### CAND
+{c_src}
+### JOBS
+{json.dumps([j for j, _ in top20], ensure_ascii=False)}
+""".strip()
+    txt = strip_fence(_gen_text_v1(prompt, MODEL_FLASH))
     try:
         data = json.loads(txt)
     except json.JSONDecodeError:
@@ -109,47 +166,453 @@ def scout_flow(cand):
     if not positions:
         positions = [j for j, _ in top20[:2]]
 
+    # 3) クリック率スコア（簡易）
     click = int(50 + 50 * np.tanh(sum(s for _, s in top20[:2])))
-    return {"selected_positions": positions, "click_score": click}
 
-def proposal_flow(cand):
+    # 4) 友達申請メッセージをサーバ側で生成（300字以内）
+    full_name = (cand.get("name") or "").strip()
+    fr_prompt = _build_friend_request_prompt(full_name, positions[:2])
+    try:
+        note = _gen_text_v1(fr_prompt, MODEL_FLASH, temperature=0.4, max_tokens=320)
+        # URL保全 → 体裁正規化（空行除去）
+        note = _ensure_url_tail(note, "https://calendly.com/k-nagase-tsugu/_linked-in-fr", 300)
+        note = _tidy_note(note)
+    except Exception as e:
+        app.logger.warning(f"[GEN-FR] fallback local due to {e}")
+        # 最終フォールバック：ローカル整形（確実に返す）
+        note = _friend_request_local(full_name, positions[:2])
+        note = _tidy_note(note)
+
+    return {
+        "selected_positions": positions[:2],
+        "click_score": click,
+        "friend_request_note": note
+    }
+
+
+def proposal_flow(cand: dict) -> Dict[str, Any]:
     jobs = load_jobs()
-    must = cand.get("must", "")
-    nice = cand.get("nice", "")
+    must = str(cand.get("must", "")).strip()
 
-    # 1) 年収フィルタ
+    # 1) 年収フィルタ（最低年収のような使い方、ざっくり）
     filtered = jobs
     if must.isdigit():
         filtered = [
             j for j in jobs
-            if j["salary"] and int(must) <= int(j["salary"][:4])
+            if j["salary"] and j["salary"][:4].isdigit()
+            and int(must) <= int(j["salary"][:4])
         ][:50]
 
-    # 2) Flash で ID 絞り込み
+    # 2) 2.5 Flash で ID 絞り込み
     flash_p = f"""
-    候補者履歴書と求人リスト。must条件を満たさない求人は除外し、20件以内に絞ってID配列を返せ
-    ### MUST
-    {must}
-    ### CAND
-    {cand.get('resume', '')[:1500]}
-    ### JOBS
-    {json.dumps(filtered, ensure_ascii=False)}
-    """
-    keep_ids = json.loads(strip_fence(flash.generate_content(flash_p).text))
-    subset   = [j for j in filtered if j["id"] in keep_ids][:20]
+候補者履歴書と求人リスト。must条件を満たさない求人は除外し、20件以内に絞ってID配列を返せ
+### MUST
+{must}
+### CAND
+{cand.get('resume', '')[:1500]}
+### JOBS
+{json.dumps(filtered, ensure_ascii=False)}
+""".strip()
+    keep_ids_json = strip_fence(_gen_text_v1(flash_p, MODEL_FLASH))
+    try:
+        keep_ids = json.loads(keep_ids_json)
+    except Exception:
+        app.logger.warning("Flash keep_ids parse error: %s …", keep_ids_json[:200])
+        keep_ids = []
+    subset = [j for j in filtered if j["id"] in keep_ids][:20]
 
-    # 3) Pro でスコアリング
+    # 3) 2.5 Flash でスコアリング（REST v1）
     pro_p = f"""
-    候補者要約と求人を読み、overall,candidate_fit,company_fit を100点満点で付与し JSON配列返却。
-    ### CAND
-    {cand.get('resume', '')[:2000]}
-    ### JOBS
-    {json.dumps(subset, ensure_ascii=False)}
-    """
-    scored = json.loads(strip_fence(pro.generate_content(pro_p).text))
-    scored = sorted(scored, key=lambda x: -x["overall_score"])[:5]
+候補者要約と求人を読み、overall_score,candidate_fit,company_fit を100点満点で付与し JSON配列返却。
+### CAND
+{cand.get('resume', '')[:2000]}
+### JOBS
+{json.dumps(subset, ensure_ascii=False)}
+""".strip()
+    scored_json = strip_fence(_gen_text_v1(pro_p, MODEL_FLASH))
+    try:
+        scored = json.loads(scored_json)
+        scored = sorted(scored, key=lambda x: -x.get("overall_score", 0))[:5]
+    except Exception:
+        app.logger.warning("Flash scoring parse error: %s …", scored_json[:200])
+        scored = subset[:5]
     return {"selected_positions": scored}
 
-# ---------- local debug ----------
+
+# =========================
+# Prompt Builders & Formatters
+# =========================
+def _normalize_salary(s: str) -> str:
+  """給与表記を軽く正規化（~, - を en dash に置換 / スペース・カンマ除去）"""
+  if not s: return ""
+  t = s.replace(" ", "").replace(",", "")
+  t = t.replace("~", "–").replace("-", "–")
+  return t
+
+def _soft_title(title: str) -> str:
+  """職種タイトルの“オブラート化”：固有語や冗長記号を薄めつつ意味は保持。"""
+  if not title: return ""
+  t = title
+  t = re.sub(r'【.*?】', '', t)                        # 先頭の【…】除去
+  t = re.sub(r'（.*?）|\(.*?\)', '', t)                # 括弧内除去
+  t = re.sub(r'「.*?」', '', t)                        # 全角引用符内を除去
+  t = re.sub(r'[/｜|].*$', '', t)                      # 区切り以降（勤務地/出社条件など）を落とす
+  t = t.replace("新規事業", "")
+  t = t.replace("テクニカルプロダクトマネージャー", "テクニカルPdM")
+  t = re.sub(r'\s+', ' ', t).strip(' -｜|/')
+  return t.strip()
+
+def _derive_role(title: str, summary: str) -> str:
+  """タイトル/サマリから“伝わる役割名”を抽出（優先順マッチ）。見つからなければsoft title。"""
+  hay = f"{title} {summary}"
+  rules = [
+    (r'インサイド.?セールス|Inside\s*Sales|IS\b', 'インサイドセールス'),
+    (r'テクニカル.?PdM|プロダクトマネージャ|PdM\b', 'テクニカルPdM'),
+    (r'プロダクト.?マネージャ|Product\s*Manager', 'PdM'),
+    (r'事業開発|Biz\s*Dev|BD\b', '事業開発'),
+    (r'カスタマー.?サクセス|Customer\s*Success|CS\b', 'カスタマーサクセス'),
+    (r'マーケティング|Marketing|Growth', 'マーケティング'),
+    (r'セールス|営業', 'セールス'),
+    (r'ソフトウェア|SWE|エンジニア|バックエンド|フロントエンド|フルスタック', 'ソフトウェアエンジニア'),
+    (r'データサイエンティスト|Data\s*Scientist', 'データサイエンティスト'),
+    (r'プロジェクトマネージャ|PM\b', 'プロジェクトマネージャ'),
+    (r'プロダクトオーナー|PO\b', 'プロダクトオーナー'),
+  ]
+  for pat, lab in rules:
+    if re.search(pat, hay, flags=re.I):
+      return lab
+  soft = _soft_title(title)
+  return soft or ""
+
+def _format_job_line(job: Dict[str, Any]) -> str:
+  """◆役割｜給与 を確実に作る（役割名が空でもデフォルトを入れる）"""
+  role = _derive_role(job.get("title",""), job.get("summary",""))
+  salary = _normalize_salary(job.get("salary",""))
+  if not role: role = "コアメンバー"
+  return f'◆{role}｜{salary}'
+
+def _ensure_url_tail(text: str, url: str, limit: int = 300) -> str:
+  """URLが必ずフルで末尾に残るよう、本文を先にトリムしてから URL を足す。"""
+  if not text: return url
+  base = text.strip()
+  if base.endswith(url): return base[:limit]
+  room = max(0, limit - (len(url) + 1))  # 改行分+1
+  if len(base) > room:
+    base = base[:max(0, room - 1)] + "…"
+  return f"{base}\n{url}"
+
+def _tidy_note(text: str) -> str:
+  """体裁正規化：連続改行を圧縮し、◆行の直前の空行を削除、見出し直後の空行も削除"""
+  if not text: return text
+  s = text.strip()
+  s = re.sub(r'\n{3,}', '\n\n', s)               # 3つ以上の連続改行 → 2つへ
+  s = re.sub(r'(―厳選求人例―)\n\s*\n', r'\1\n', s)  # 見出し直後の空行削除
+  s = re.sub(r'\n\s*\n(◆)', r'\n\1', s)          # ◆行直前の空行削除
+  return s
+
+def _build_friend_request_prompt(full_name: str, positions: List[Dict[str, Any]]) -> str:
+  """構成要素を与え、モデルに“結合だけ”をさせる（役割名はサーバで確定）"""
+  last_name = (full_name or "").split()[-1] if full_name else ""
+  p1 = positions[0] if positions else {}
+  p2 = positions[1] if len(positions) > 1 else None
+
+  job1 = _format_job_line(p1)
+  job2 = _format_job_line(p2) if p2 else ""
+
+  intro = (
+      f'ハイクラス向け人材紹介会社"TSUGU"代表の服部です。'
+      f'{last_name}様のご経歴を拝見し、ぜひご紹介したい求人がございます。'
+  )
+  calendly = "https://calendly.com/k-nagase-tsugu/_linked-in-fr"
+
+  return f"""
+あなたは提供された「構成要素」を、以下の「組み立て手順」に100%従って結合するボットです。余計な語句は一切追加しません。
+
+# 組み立て手順
+1.{{greeting}}
+2.{{subject}}
+3.{{introduction}}
+(空行)
+4.{{job_section_header}}
+5.{{job_line_1}}
+6.{{job_line_2}}
+(空行)
+7.{{closing_line_1}}
+8.{{closing_line_2}}
+(空行)
+9.{{call_to_action}}
+10.{{link}}
+
+# 構成要素
+{{greeting}}: "{last_name}様"
+{{subject}}: "【国内トップ層向け案件紹介】"
+{{introduction}}: "{intro}"
+{{job_section_header}}: "―厳選求人例―"
+{{job_line_1}}: "{job1}"
+{{job_line_2}}: "{job2}"
+{{closing_line_1}}: "いずれも裁量大きく、事業成長を牽引できるポジションです。"
+{{closing_line_2}}: "他にも100社以上の非公開求人を扱っております。"
+{{call_to_action}}: "ご興味あれば、面談をお願いいたします。"
+{{link}}: "{calendly}"
+
+# 絶対ルール
+- 手順・構成要素にない語句や記号、絵文字を追加しない。
+- 完成メッセージ本文だけを300文字以内で出力。説明・コードフェンス禁止。
+""".strip()
+
+def _friend_request_local(full_name: str, positions: List[Dict[str, Any]]) -> str:
+  """最終フォールバック（役割名正規化＆URL保全＆空行正規化）"""
+  last_name = (full_name or "").split()[-1] if full_name else ""
+  p1 = positions[0] if positions else {}
+  p2 = positions[1] if len(positions) > 1 else None
+  line1 = _format_job_line(p1)
+  line2 = _format_job_line(p2) if p2 else ""
+  jobs_block = "\n".join([l for l in [line1, line2] if l.strip()])
+  calendly = "https://calendly.com/k-nagase-tsugu/_linked-in-fr"
+
+  prefix = (
+      f"{(last_name + '様') if last_name else ''}\n【国内トップ層向け案件紹介】\n"
+      f"ハイクラス向け人材紹介会社\"TSUGU\"代表の服部です。ご経歴を拝見し、ぜひご紹介したい求人がございます。\n"
+      f"―厳選求人例―\n{jobs_block}\n"
+      f"ご興味あれば、面談をお願いいたします。\n"
+  )
+  return _ensure_url_tail(_tidy_note(prefix), calendly, 300)
+
+
+# =========================
+# Embedding helpers
+# =========================
+def _to_vec(resp):
+    """EmbedContentResponse / dict のどちらでも [float] を返す"""
+    # dict 形（旧SDK互換）
+    if isinstance(resp, dict):
+        if "embedding" in resp:
+            emb = resp["embedding"]
+            if isinstance(emb, dict) and "values" in emb:
+                return emb["values"]
+            if isinstance(emb, list):
+                return emb
+        if "embeddings" in resp and resp["embeddings"]:
+            emb0 = resp["embeddings"][0]
+            if isinstance(emb0, dict) and "values" in emb0:
+                return emb0["values"]
+            if isinstance(emb0, list):
+                return emb0
+    # v1 オブジェクト
+    if hasattr(resp, "embeddings") and getattr(resp, "embeddings"):
+        emb0 = resp.embeddings[0]
+        if hasattr(emb0, "values"):
+            return list(emb0.values)
+    if hasattr(resp, "embedding") and hasattr(resp.embedding, "values"):
+        return list(resp.embedding.values)
+    raise ValueError(f"Unexpected embedding response shape: {type(resp)} -> {resp}")
+
+def _embed_once(text: str):
+    # v1 Client で contents= フォーマット
+    r = CLIENT.models.embed_content(
+        model="text-embedding-004",
+        contents=[{"role": "user", "parts": [{"text": text}]}],
+    )
+    return _to_vec(r)
+
+
+# =========================
+# v1 Models helper
+# =========================
+_LISTED_MODELS = None
+def _list_models_v1():
+    """このAPIキーで見える v1 モデル一覧（キャッシュ）"""
+    global _LISTED_MODELS
+    if _LISTED_MODELS is not None:
+        return _LISTED_MODELS
+    import requests
+    url = f"https://generativelanguage.googleapis.com/v1/models?key={_API_KEY}"
+    r = requests.get(url, timeout=30)
+    if not r.ok:
+        print(f"[MODELS] list failed: {r.status_code} {r.text[:300]}")
+        _LISTED_MODELS = []
+        return _LISTED_MODELS
+    data = r.json()
+    _LISTED_MODELS = data.get("models") or []
+    gen = [
+        m.get("name", "").split("/")[-1]
+        for m in _LISTED_MODELS
+        if "generateContent" in (m.get("supportedGenerationMethods") or [])
+    ]
+    print(f"[MODELS] generateContent-capable: {gen}")
+    return _LISTED_MODELS
+
+def _pick_model_for_generate():
+    """
+    ListModels の中から generateContent をサポートするモデルを優先順で選ぶ。
+    優先: 2.5 → 2.0 → 1.5 → 1.0
+    """
+    models = _list_models_v1()
+    def ok(m): return "generateContent" in (m.get("supportedGenerationMethods") or [])
+    names = [(m.get("name", "").split("/")[-1], m) for m in models if ok(m)]
+    order = [
+        # 2.5
+        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro",
+        # 2.0
+        "gemini-2.0-flash", "gemini-2.0-flash-001", "gemini-2.0-flash-lite",
+        "gemini-2.0-flash-preview-image-generation",
+        # 1.5
+        "gemini-1.5-flash-8b-latest", "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-002", "gemini-1.5-flash",
+        "gemini-1.5-pro-latest", "gemini-1.5-pro-001", "gemini-1.5-pro",
+        # 1.0
+        "gemini-1.0-pro-latest", "gemini-1.0-pro",
+    ]
+    for want in order:
+        for nm, _ in names:
+            if nm == want:
+                return nm
+    for pref in ["gemini-2.5", "gemini-2.0", "gemini-1.5", "gemini-1.0"]:
+        for nm, _ in names:
+            if nm.startswith(pref):
+                return nm
+    if names:
+        return names[0][0]
+    raise RuntimeError("No model with generateContent is visible for this API key")
+
+
+# =========================
+# v1 Text generation (timeout & fallback)
+# =========================
+def _gen_text_v1(
+    prompt: str,
+    model: str = None,
+    temperature: float = 0.4,
+    max_tokens: int = 512
+) -> str:
+    """
+    v1 REST generateContent。
+    モデルは 引数 > 環境 MODEL_FLASH > ListModels > 既知バックアップ の順で試行。
+    Timeout時は flash-lite に自動フォールバック。
+    """
+    import requests
+
+    if not _API_KEY:
+        raise RuntimeError("GEMINI_API_KEY/GOOGLE_API_KEY is not set")
+
+    candidates = []
+    if model:
+        candidates.append(model)
+    if MODEL_FLASH and MODEL_FLASH not in candidates:
+        candidates.append(MODEL_FLASH)
+    try:
+        picked = _pick_model_for_generate()
+        if picked not in candidates:
+            candidates.append(picked)
+    except Exception as e:
+        print(f"[MODELS] pick failed: {e}")
+
+    for b in [
+        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro",
+        "gemini-2.0-flash", "gemini-2.0-flash-001", "gemini-2.0-flash-lite",
+        "gemini-1.5-flash-latest", "gemini-1.5-flash-002",
+        "gemini-1.5-pro-latest", "gemini-1.5-pro",
+    ]:
+        if b not in candidates:
+            candidates.append(b)
+
+    seen, last = set(), None
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}
+    }
+    for mdl in [c for c in candidates if not (c in seen or seen.add(c))]:
+        url = f"https://generativelanguage.googleapis.com/v1/models/{mdl}:generateContent?key={_API_KEY}"
+        try:
+            # 接続10秒 / 応答60秒
+            r = requests.post(url, json=body, timeout=(10, 60))
+            if r.status_code in (429, 500, 503):
+                time.sleep(0.5)
+                r = requests.post(url, json=body, timeout=(10, 60))
+            if not r.ok:
+                last = f"{mdl} -> {r.status_code} {r.text[:300]}"
+                print(f"[GEN] {last}")
+                continue
+            data = r.json()
+            cands = (data.get("candidates") or [])
+            if cands:
+                parts = (cands[0].get("content") or {}).get("parts") or []
+                if parts and isinstance(parts[0], dict) and "text" in parts[0]:
+                    print(f"[GEN] ok via {mdl}")
+                    return parts[0]["text"].strip()
+            last = f"{mdl} -> unexpected shape {json.dumps(data)[:300]}"
+            print(f"[GEN] {last}")
+        except requests.exceptions.Timeout:
+            # timeout は flash-lite にフォールバック
+            if mdl != "gemini-2.5-flash-lite":
+                print(f"[GEN] {mdl} -> Timeout. fallback to flash-lite")
+                try:
+                    url2 = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent?key={_API_KEY}"
+                    r2 = requests.post(url2, json=body, timeout=(10, 60))
+                    if r2.ok:
+                        data2 = r2.json()
+                        c2 = (data2.get("candidates") or [])
+                        if c2:
+                            p2 = (c2[0].get("content") or {}).get("parts") or []
+                            if p2 and isinstance(p2[0], dict) and "text" in p2[0]:
+                                print("[GEN] ok via gemini-2.5-flash-lite")
+                                return p2[0]["text"].strip()
+                    last = f"flash-lite fallback failed: {r2.status_code if r2 else 'noresp'}"
+                    print(f"[GEN] {last}")
+                except Exception as e2:
+                    last = f"flash-lite error: {e2}"
+                    print(f"[GEN] {last}")
+            else:
+                last = f"{mdl} -> Timeout"
+                print(f"[GEN] {last}")
+        except Exception as e:
+            last = f"{mdl} -> {e}"
+            print(f"[GEN] {last}")
+            continue
+    raise RuntimeError(f"REST v1 generateContent failed. last={last}; tried={candidates}")
+
+
+# =========================
+# Debug endpoint
+# =========================
+def _debug_models_v1():
+    """ListModels のうち generateContent 対応モデル名一覧を返す"""
+    try:
+        models = _list_models_v1()
+        gen = [
+            m.get("name", "").split("/")[-1]
+            for m in models
+            if "generateContent" in (m.get("supportedGenerationMethods") or [])
+        ]
+        return {"generateContent": gen}, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
+# 二重登録で落ちないように、add_url_rule で endpoint 名を固定・例外も握る
+try:
+    app.add_url_rule("/debug/models", endpoint="debug_models_v1",
+                     view_func=_debug_models_v1, methods=["GET"])
+except Exception as _e:
+    print(f"[DEBUG] route /debug/models already set or failed: {_e}")
+
+
+# =========================
+# Error handler
+# =========================
+@app.errorhandler(Exception)
+def _app_error(e):
+    import traceback, sys
+    tb = "".join(traceback.format_exception(*sys.exc_info()))
+    print(tb)
+    try:
+        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return {"error": str(e)}, 500
+
+
+# =========================
+# Local debug
+# =========================
 if __name__ == "__main__":
     app.run("0.0.0.0", port=8080, debug=True)

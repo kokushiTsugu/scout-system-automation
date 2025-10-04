@@ -200,3 +200,21 @@ gas/**/.claspignore
 gas/**/node_modules/
 main
 oauth_client.json
+# GAS / local auth
+gas/**/.clasp.json
+temp_clasprc.json
+
+# Backups / temp
+*.bak
+*.bak.*
+match_api/main.py.bak*
+*.pyc
+__pycache__/
+
+# Node
+functions/**/node_modules/
+# lockは原則コミットする派なら次行は外す
+# functions/**/package-lock.json
+
+# Samples
+functions/**/sample.pdf

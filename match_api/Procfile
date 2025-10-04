@@ -1,1 +1,1 @@
-web: gunicorn -b :$PORT match_api.main:app
+web: gunicorn -w 1 -b :$PORT main:app

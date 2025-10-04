@@ -38,7 +38,7 @@ creds           = creds.with_scopes(SCOPES)
 storage_client  = storage.Client(credentials=creds)
 sheets_service  = build("sheets", "v4", credentials=creds)
 genai.configure(credentials=creds)
-model           = genai.GenerativeModel("gemini-1.5-flash")
+model           = genai.GenerativeModel("gemini-1.5-flash-latest")
 
 # ─────────────────────────────
 # 2. プロンプト読み込み（起動時 1 回）

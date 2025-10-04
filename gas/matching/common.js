@@ -10,7 +10,7 @@ const COO_NAME     = '長瀬';
 
 const GEMINI_KEY = PropertiesService.getScriptProperties()
                    .getProperty('GEMINI_API_KEY');
-const GEMINI_EP  = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent';
+const GEMINI_EP  = 'https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent';
 
 /* ==== 共通 Gemini 呼び出し ==== */
 function callGemini_(prompt, temperature = 0.4) {

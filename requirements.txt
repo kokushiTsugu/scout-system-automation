@@ -2,3 +2,4 @@
 
 # match_api をパッケージとしてインストール
 -e ./match_api
+google-generativeai>=0.7.0

@@ -509,7 +509,7 @@ def _embed_once(text: str):
 # =========================
 _LISTED_MODELS = None
 def _list_models_v1():
-    """このAPIキーで見える v1 モデル一覧（キャッシュ）"""
+    """このAPIキーで見える v1/v1beta モデル一覧（キャッシュ）"""
     global _LISTED_MODELS
     if _LISTED_MODELS is not None:
         return _LISTED_MODELS

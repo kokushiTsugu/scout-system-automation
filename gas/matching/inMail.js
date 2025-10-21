@@ -11,7 +11,12 @@
 const USE_MATCH_API = true; // false で従来（Gemini直叩き）へフォールバック
 
 // ===== Match API endpoint =====
-const MATCH_API_BASE = 'https://match-api-650488873290.asia-northeast1.run.app/match';
+const MATCH_API_BASE = (function() {
+  const base = (typeof MATCH_URL_FR_ONLY === 'string' && MATCH_URL_FR_ONLY)
+    ? MATCH_URL_FR_ONLY.split('?')[0]
+    : null;
+  return base || 'https://match-api-650488873290.asia-northeast1.run.app/match';
+})();
 const MATCH_API_URL_INMAIL = MATCH_API_BASE + '?mode=inmail';
 
 // ===== Logging / Build Tag =====

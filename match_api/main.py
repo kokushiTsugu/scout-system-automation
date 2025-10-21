@@ -582,27 +582,20 @@ def _gen_text_v1(
     temperature: float = 0.4,
     max_tokens: int = 512
 ) -> str:
-    """
-    v1 REST generateContent。
-    モデルは 引数 > 環境 MODEL_FLASH > ListModels > 既知バックアップ の順で試行。
-    Timeout時は flash-lite に自動フォールバック。
-    """
+    """REST v1 generateContent with fixed fallback order and flash-lite safety net."""
     import requests
 
     if not _API_KEY:
         raise RuntimeError("GEMINI_API_KEY/GOOGLE_API_KEY is not set")
 
-    candidates = []
+    candidates: List[str] = []
     if model:
         candidates.append(model)
     if MODEL_FLASH and MODEL_FLASH not in candidates:
         candidates.append(MODEL_FLASH)
-    try:
-        picked = _pick_model_for_generate()
-        if picked and picked not in candidates:
-            candidates.append(picked)
-    except Exception as e:
-        print(f"[MODELS] pick failed: {e}")
+    for hard in ["gemini-2.5-flash", "gemini-2.5-flash-lite"]:
+        if hard not in candidates:
+            candidates.append(hard)
 
     try:
         for mdl in _list_models_v1():
@@ -612,93 +605,72 @@ def _gen_text_v1(
             methods = mdl.get("supportedGenerationMethods") or []
             if "generateContent" in methods:
                 candidates.append(name)
-    except Exception as e:
-        print(f"[MODELS] list failed: {e}")
+    except Exception as exc:
+        print(f"[MODELS] list failed: {exc}")
 
-    for b in [
-        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro",
-        "gemini-2.0-flash", "gemini-2.0-flash-001", "gemini-2.0-flash-lite",
-        "gemini-1.5-flash-latest", "gemini-1.5-flash-002",
-        "gemini-1.5-pro-latest", "gemini-1.5-pro",
-    ]:
-        if b not in candidates:
-            candidates.append(b)
-
-    seen, last = set(), None
-    versions = ("v1", "v1beta")
+    versions = ("v1",)
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
     }
 
-    def _post_model(model_name: str, version: str):
+    def _post(model_name: str, version: str):
         url = (
-            f"https://generativelanguage.googleapis.com/"
+            "https://generativelanguage.googleapis.com/"
             f"{version}/models/{model_name}:generateContent?key={_API_KEY}"
         )
         return requests.post(url, json=body, timeout=(10, 60))
 
-    def _handle_response(model_name: str, version: str):
-        nonlocal last
-        r = _post_model(model_name, version)
-        if r.status_code in (429, 500, 503):
+    def _try_model(model_name: str, version: str):
+        response = _post(model_name, version)
+        if response.status_code in (429, 500, 503):
             time.sleep(0.5)
-            r = _post_model(model_name, version)
-        if not r.ok:
-            last = f"{model_name}@{version} -> {r.status_code} {r.text[:300]}"
-            print(f"[GEN] {last}")
-            return None, r.status_code == 404
-        data = r.json()
-        cands = (data.get("candidates") or [])
-        if cands:
-            parts = (cands[0].get("content") or {}).get("parts") or []
-            if parts and isinstance(parts[0], dict) and "text" in parts[0]:
+            response = _post(model_name, version)
+        if not response.ok:
+            print(f"[GEN] {model_name}@{version} -> {response.status_code} {response.text[:300]}")
+            return None, response.status_code == 404
+        data = response.json()
+        parts = (data.get("candidates") or [])
+        if parts:
+            first = (parts[0].get("content") or {}).get("parts") or []
+            if first and isinstance(first[0], dict) and "text" in first[0]:
                 print(f"[GEN] ok via {model_name}@{version}")
-                return parts[0]["text"].strip(), False
-        last = f"{model_name}@{version} -> unexpected shape {json.dumps(data)[:300]}"
-        print(f"[GEN] {last}")
+                return first[0]["text"].strip(), False
+        print(f"[GEN] {model_name}@{version} -> unexpected {json.dumps(data)[:300]}")
         return None, False
 
-    def _flash_lite_fallback(primary_version: str):
-        order = (primary_version,) + tuple(v for v in versions if v != primary_version)
-        for ver in order:
-            try:
-                text, retry_next = _handle_response("gemini-2.5-flash-lite", ver)
-                if text:
-                    return text
-                if retry_next:
-                    continue
-            except requests.exceptions.Timeout:
-                print(f"[GEN] gemini-2.5-flash-lite@{ver} -> Timeout")
-                continue
-        return None
+    seen: set = set()
+    last_error = None
 
-    for mdl in [c for c in candidates if not (c in seen or seen.add(c))]:
-        for version in versions:
+    for mdl in candidates:
+        if mdl in seen:
+            continue
+        seen.add(mdl)
+        for ver in versions:
             try:
-                text, retry_next = _handle_response(mdl, version)
+                text, retry_next = _try_model(mdl, ver)
                 if text:
                     return text
                 if retry_next:
-                    continue  # 該当モデルの別バージョンを試す
-                break  # 404 以外のエラーは次のモデルへ
-            except requests.exceptions.Timeout:
-                if mdl != "gemini-2.5-flash-lite":
-                    print(f"[GEN] {mdl}@{version} -> Timeout. fallback to flash-lite")
-                    fallback_text = _flash_lite_fallback(version)
-                    if fallback_text:
-                        return fallback_text
-                    last = f"flash-lite fallback failed after timeout ({mdl}@{version})"
-                    print(f"[GEN] {last}")
                     continue
-                last = f"{mdl}@{version} -> Timeout"
-                print(f"[GEN] {last}")
                 break
-        else:
-            continue
-    raise RuntimeError(
-        f"REST v1 generateContent failed. last={last}; tried={candidates}"
-    )
+            except requests.exceptions.Timeout:
+                print(f"[GEN] {mdl}@{ver} -> Timeout; try flash-lite")
+                if mdl != "gemini-2.5-flash-lite":
+                    try:
+                        fallback_text, _ = _try_model("gemini-2.5-flash-lite", ver)
+                        if fallback_text:
+                            return fallback_text
+                    except requests.exceptions.Timeout:
+                        print(f"[GEN] gemini-2.5-flash-lite@{ver} -> Timeout")
+                last_error = f"{mdl}@{ver} Timeout"
+                continue
+            last_error = f"{mdl}@{ver} failed"
+
+    detail = f" after candidates={candidates}"
+    if last_error:
+        detail += f"; last={last_error}"
+    raise RuntimeError(f"REST v1 generateContent failed{detail}")
 
 
 # =========================

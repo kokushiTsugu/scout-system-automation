@@ -107,20 +107,27 @@ def healthz():
 # =========================
 @app.route("/match", methods=["POST"])
 def match():
-    mode = request.args.get("mode", "scout")
+    mode = (request.args.get("mode", "scout") or "").lower()
     body = request.get_json(silent=True)
     if not body or "candidate" not in body:
         return jsonify(error="candidate required"), 400
 
     cand = body["candidate"]
     try:
-        if mode == "scout":
-            result = scout_flow(cand)
+        if mode == "inmail":
+            result = inmail_flow(body)
+        elif mode == "scout":
+            if body.get("prompt"):
+                result = inmail_flow(body)
+            else:
+                result = scout_flow(cand)
         elif mode == "proposal":
             result = proposal_flow(cand)
         else:
             return jsonify(error="mode must be scout|proposal"), 400
         return jsonify(result), 200
+    except ValueError as ve:
+        return jsonify(error=str(ve)), 400
     except Exception as e:
         app.logger.exception("match() failed")
         return jsonify(error=str(e)), 500
@@ -237,6 +244,87 @@ def proposal_flow(cand: dict) -> Dict[str, Any]:
         app.logger.warning("Flash scoring parse error: %s …", scored_json[:200])
         scored = subset[:5]
     return {"selected_positions": scored}
+
+
+def inmail_flow(body: dict) -> Dict[str, Any]:
+    """Generate inMail content via Gemini using a pre-built prompt from GAS."""
+    prompt = body.get("prompt", "")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt required for inmail flow")
+
+    options = body.get("options") or {}
+    temperature = options.get("temperature", 0.4)
+    try:
+        temperature = float(temperature)
+    except Exception:
+        temperature = 0.4
+
+    max_output = (
+        options.get("maxOutput")
+        or options.get("max_output")
+        or options.get("max_tokens")
+        or options.get("maxTokens")
+        or 1024
+    )
+    try:
+        max_output = int(max_output)
+    except Exception:
+        max_output = 1024
+
+    raw = _gen_text_v1(prompt, MODEL_FLASH, temperature=temperature, max_tokens=max_output)
+    clean = strip_fence(raw)
+    try:
+        parsed = json.loads(clean)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"inmail JSON parse error: {clean[:200]}") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("inmail response must be a JSON object")
+
+    positions = parsed.get("positions")
+    if not isinstance(positions, list) or not positions:
+        raise RuntimeError("inmail JSON missing positions array")
+
+    sanitized_positions = []
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        sanitized_positions.append(
+            {
+                "id": str(pos.get("id") or ""),
+                "title": str(pos.get("title") or ""),
+                "company_desc": str(pos.get("company_desc") or pos.get("company") or ""),
+                "salary": str(pos.get("salary") or ""),
+                "appeal_points": (
+                    pos.get("appeal_points")
+                    if isinstance(pos.get("appeal_points"), list)
+                    else (
+                        [str(pos.get("appeal_points"))]
+                        if pos.get("appeal_points")
+                        else []
+                    )
+                ),
+            }
+        )
+
+    sanitized_positions = [p for p in sanitized_positions if any([p["title"], p["company_desc"], p["salary"], p["appeal_points"]])]
+
+    if not sanitized_positions:
+        raise RuntimeError("inmail JSON positions missing required fields")
+
+    subject = parsed.get("subject")
+    intro = parsed.get("intro_sentence") or parsed.get("intro")
+    closing = parsed.get("closing_sentence") or parsed.get("closing")
+
+    if not all(isinstance(x, str) and x.strip() for x in [subject, intro, closing]):
+        raise RuntimeError("inmail JSON missing subject/intro/closing")
+
+    return {
+        "positions": sanitized_positions,
+        "subject": subject.strip(),
+        "intro_sentence": intro.strip(),
+        "closing_sentence": closing.strip(),
+    }
 
 
 # =========================
@@ -421,25 +509,34 @@ def _embed_once(text: str):
 # =========================
 _LISTED_MODELS = None
 def _list_models_v1():
-    """このAPIキーで見える v1 モデル一覧（キャッシュ）"""
+    """このAPIキーで見える v1/v1beta モデル一覧（キャッシュ）"""
     global _LISTED_MODELS
     if _LISTED_MODELS is not None:
         return _LISTED_MODELS
+
     import requests
-    url = f"https://generativelanguage.googleapis.com/v1/models?key={_API_KEY}"
-    r = requests.get(url, timeout=30)
-    if not r.ok:
-        print(f"[MODELS] list failed: {r.status_code} {r.text[:300]}")
-        _LISTED_MODELS = []
-        return _LISTED_MODELS
-    data = r.json()
-    _LISTED_MODELS = data.get("models") or []
-    gen = [
-        m.get("name", "").split("/")[-1]
-        for m in _LISTED_MODELS
-        if "generateContent" in (m.get("supportedGenerationMethods") or [])
-    ]
-    print(f"[MODELS] generateContent-capable: {gen}")
+
+    def _fetch(version: str):
+        url = f"https://generativelanguage.googleapis.com/{version}/models?key={_API_KEY}"
+        resp = requests.get(url, timeout=30)
+        if not resp.ok:
+            print(f"[MODELS] list {version} failed: {resp.status_code} {resp.text[:300]}")
+            return []
+        data = resp.json()
+        models = data.get("models") or []
+        gen = [
+            m.get("name", "").split("/")[-1]
+            for m in models
+            if "generateContent" in (m.get("supportedGenerationMethods") or [])
+        ]
+        print(f"[MODELS] {version} generateContent-capable: {gen}")
+        return models
+
+    models = _fetch("v1")
+    if not models:
+        models = _fetch("v1beta")
+
+    _LISTED_MODELS = models
     return _LISTED_MODELS
 
 def _pick_model_for_generate():
@@ -502,10 +599,21 @@ def _gen_text_v1(
         candidates.append(MODEL_FLASH)
     try:
         picked = _pick_model_for_generate()
-        if picked not in candidates:
+        if picked and picked not in candidates:
             candidates.append(picked)
     except Exception as e:
         print(f"[MODELS] pick failed: {e}")
+
+    try:
+        for mdl in _list_models_v1():
+            name = (mdl.get("name", "") or "").split("/")[-1]
+            if not name or name in candidates:
+                continue
+            methods = mdl.get("supportedGenerationMethods") or []
+            if "generateContent" in methods:
+                candidates.append(name)
+    except Exception as e:
+        print(f"[MODELS] list failed: {e}")
 
     for b in [
         "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro",
@@ -517,59 +625,80 @@ def _gen_text_v1(
             candidates.append(b)
 
     seen, last = set(), None
+    versions = ("v1", "v1beta")
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}
     }
-    for mdl in [c for c in candidates if not (c in seen or seen.add(c))]:
-        url = f"https://generativelanguage.googleapis.com/v1/models/{mdl}:generateContent?key={_API_KEY}"
-        try:
-            # 接続10秒 / 応答60秒
-            r = requests.post(url, json=body, timeout=(10, 60))
-            if r.status_code in (429, 500, 503):
-                time.sleep(0.5)
-                r = requests.post(url, json=body, timeout=(10, 60))
-            if not r.ok:
-                last = f"{mdl} -> {r.status_code} {r.text[:300]}"
-                print(f"[GEN] {last}")
+
+    def _post_model(model_name: str, version: str):
+        url = (
+            f"https://generativelanguage.googleapis.com/"
+            f"{version}/models/{model_name}:generateContent?key={_API_KEY}"
+        )
+        return requests.post(url, json=body, timeout=(10, 60))
+
+    def _handle_response(model_name: str, version: str):
+        nonlocal last
+        r = _post_model(model_name, version)
+        if r.status_code in (429, 500, 503):
+            time.sleep(0.5)
+            r = _post_model(model_name, version)
+        if not r.ok:
+            last = f"{model_name}@{version} -> {r.status_code} {r.text[:300]}"
+            print(f"[GEN] {last}")
+            return None, r.status_code == 404
+        data = r.json()
+        cands = (data.get("candidates") or [])
+        if cands:
+            parts = (cands[0].get("content") or {}).get("parts") or []
+            if parts and isinstance(parts[0], dict) and "text" in parts[0]:
+                print(f"[GEN] ok via {model_name}@{version}")
+                return parts[0]["text"].strip(), False
+        last = f"{model_name}@{version} -> unexpected shape {json.dumps(data)[:300]}"
+        print(f"[GEN] {last}")
+        return None, False
+
+    def _flash_lite_fallback(primary_version: str):
+        order = (primary_version,) + tuple(v for v in versions if v != primary_version)
+        for ver in order:
+            try:
+                text, retry_next = _handle_response("gemini-2.5-flash-lite", ver)
+                if text:
+                    return text
+                if retry_next:
+                    continue
+            except requests.exceptions.Timeout:
+                print(f"[GEN] gemini-2.5-flash-lite@{ver} -> Timeout")
                 continue
-            data = r.json()
-            cands = (data.get("candidates") or [])
-            if cands:
-                parts = (cands[0].get("content") or {}).get("parts") or []
-                if parts and isinstance(parts[0], dict) and "text" in parts[0]:
-                    print(f"[GEN] ok via {mdl}")
-                    return parts[0]["text"].strip()
-            last = f"{mdl} -> unexpected shape {json.dumps(data)[:300]}"
-            print(f"[GEN] {last}")
-        except requests.exceptions.Timeout:
-            # timeout は flash-lite にフォールバック
-            if mdl != "gemini-2.5-flash-lite":
-                print(f"[GEN] {mdl} -> Timeout. fallback to flash-lite")
-                try:
-                    url2 = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent?key={_API_KEY}"
-                    r2 = requests.post(url2, json=body, timeout=(10, 60))
-                    if r2.ok:
-                        data2 = r2.json()
-                        c2 = (data2.get("candidates") or [])
-                        if c2:
-                            p2 = (c2[0].get("content") or {}).get("parts") or []
-                            if p2 and isinstance(p2[0], dict) and "text" in p2[0]:
-                                print("[GEN] ok via gemini-2.5-flash-lite")
-                                return p2[0]["text"].strip()
-                    last = f"flash-lite fallback failed: {r2.status_code if r2 else 'noresp'}"
+        return None
+
+    for mdl in [c for c in candidates if not (c in seen or seen.add(c))]:
+        for version in versions:
+            try:
+                text, retry_next = _handle_response(mdl, version)
+                if text:
+                    return text
+                if retry_next:
+                    continue  # 該当モデルの別バージョンを試す
+                break  # 404 以外のエラーは次のモデルへ
+            except requests.exceptions.Timeout:
+                if mdl != "gemini-2.5-flash-lite":
+                    print(f"[GEN] {mdl}@{version} -> Timeout. fallback to flash-lite")
+                    fallback_text = _flash_lite_fallback(version)
+                    if fallback_text:
+                        return fallback_text
+                    last = f"flash-lite fallback failed after timeout ({mdl}@{version})"
                     print(f"[GEN] {last}")
-                except Exception as e2:
-                    last = f"flash-lite error: {e2}"
-                    print(f"[GEN] {last}")
-            else:
-                last = f"{mdl} -> Timeout"
+                    continue
+                last = f"{mdl}@{version} -> Timeout"
                 print(f"[GEN] {last}")
-        except Exception as e:
-            last = f"{mdl} -> {e}"
-            print(f"[GEN] {last}")
+                break
+        else:
             continue
-    raise RuntimeError(f"REST v1 generateContent failed. last={last}; tried={candidates}")
+    raise RuntimeError(
+        f"REST v1 generateContent failed. last={last}; tried={candidates}"
+    )
 
 
 # =========================

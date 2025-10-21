@@ -533,8 +533,6 @@ def _list_models_v1():
         return models
 
     models = _fetch("v1")
-    if not models:
-        models = _fetch("v1beta")
 
     _LISTED_MODELS = models
     return _LISTED_MODELS
@@ -593,7 +591,24 @@ def _gen_text_v1(
         candidates.append(model)
     if MODEL_FLASH and MODEL_FLASH not in candidates:
         candidates.append(MODEL_FLASH)
-    for hard in ["gemini-2.5-flash", "gemini-2.5-flash-lite"]:
+    hard_fallbacks = [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-001",
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash-lite-001",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-002",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-pro-001",
+        "gemini-1.5-pro",
+        "gemini-1.0-pro-latest",
+        "gemini-1.0-pro",
+    ]
+    for hard in hard_fallbacks:
         if hard not in candidates:
             candidates.append(hard)
 

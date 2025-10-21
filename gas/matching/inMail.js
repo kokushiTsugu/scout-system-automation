@@ -43,7 +43,7 @@ function createWatchdog(){
 
 function withScriptLock(fn) {
   const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  lock.waitLock(30_000);
   try { return fn(); } finally { lock.releaseLock(); }
 }
 
@@ -75,15 +75,16 @@ function postMatchApiWithBackoff(url, payload, headers, maxRetries = 6) {
         const m = body.match(/retry in ([\d.]+)s/i);
         if (m) ms = Math.ceil(parseFloat(m[1]) * 1000);
       }
-      if (!ms) ms = Math.min(30000, 500 * Math.pow(2, attempt));
+      if (!ms) ms = Math.min(30_000, 500 * Math.pow(2, attempt));
       _log(`429 -> sleep ${ms}ms (attempt=${attempt})`);
       Utilities.sleep(ms);
     } else if (code >= 500 && code < 600) {
       if (attempt >= maxRetries) throw new Error(`match-api 5xx(${code}) after retries: ${body}`);
-      const ms = Math.min(30000, 500 * Math.pow(2, attempt));
+      const ms = Math.min(30_000, 500 * Math.pow(2, attempt));
       _log(`5xx(${code}) -> sleep ${ms}ms (attempt=${attempt})`);
       Utilities.sleep(ms);
     } else {
+      _log('error resp', String(body).slice(0, 500));
       throw new Error(`match-api Error ${code}: ${body}`);
     }
     attempt++;
@@ -246,18 +247,17 @@ function _runBatchScoutMatching() {
         const headers = {};
         const body = {
           mode: 'inmail',
-          input: {
-            rid: RID,
-            prompt,
-            candidate: {
-              name: fullName,
-              last_name: lastName,
-              profile_text: profile,
-            },
-            jobCatalog: compactCatalog,
-            options: { locale: 'ja-JP', maxOutput: 1024, temperature: 0.4 },
+          rid: RID,
+          prompt,
+          candidate: {
+            name: fullName,
+            last_name: lastName,
+            profile,
           },
+          jobCatalog: compactCatalog,
+          options: { locale: 'ja-JP', maxOutput: 1024, temperature: 0.4 },
         };
+        _log('request keys', Object.keys(body));
         const json = postMatchApiWithBackoff(MATCH_API_URL_INMAIL, body, headers, 6);
         const adapted = adaptMatchApiInMailResponse(json);
         aiText = adapted.rawText;

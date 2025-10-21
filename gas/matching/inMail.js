@@ -12,6 +12,29 @@ const SHEET_JOBS   = 'Job_Database';
 const SHEET_CANDS  = 'Candidate_Pipeline';
 const MAX_BATCH    = 15;
 
+/* ===== 2. 補助ユーティリティ ===== */
+function compactJobCatalog(jobs) {
+  const squeeze = (txt, limit) => {
+    if (!txt) return '';
+    const flat = String(txt).replace(/[\s\u3000]+/g, ' ').trim();
+    if (!limit) return flat;
+    return flat.length <= limit ? flat : flat.slice(0, limit - 1) + '…';
+  };
+
+  return jobs.map(job => ({
+    id      : job.id,
+    company : job.company,
+    title   : job.title,
+    salary  : squeeze(job.salary, 60),
+    summary : squeeze(job.summary, 280),
+    location: squeeze(job.location, 60),
+    must    : squeeze(job.must, 220),
+    plus    : squeeze(job.plus, 180),
+    person  : squeeze(job.person, 120),
+    appeal  : squeeze(job.appeal, 160),
+  }));
+}
+
 /* ===== 3. メイン処理 (修正版) ===== */
 function runBatchScoutMatching() {
   const ui        = SpreadsheetApp.getUi();
@@ -41,6 +64,8 @@ function runBatchScoutMatching() {
     return;
   }
 
+  const jobCatalogPayload = JSON.stringify(compactJobCatalog(jobJson));
+
   /* 3-2. 候補者ループ */
   const rows    = candSheet.getDataRange().getValues();
   let   handled = 0;
@@ -57,7 +82,7 @@ function runBatchScoutMatching() {
       // ★ 姓名の間のスペースで分割し、姓を取得
       const lastName = fullName.split(/[\\s　]/)[0]; // ← 変数は残してOK
 
-      const prompt  = buildPrompt('{姓}', profile, JSON.stringify(jobJson, null, 2));
+      const prompt  = buildPrompt('{姓}', profile, jobCatalogPayload);
       const aiText  = callGemini(prompt);
       const data    = JSON.parse(aiText);
 
@@ -219,24 +244,37 @@ function callGemini(prompt) {
         muteHttpExceptions: true,
       });
 
+      const status = resp.getResponseCode();
+      const body   = resp.getContentText();
+
+      // 429 (rate limit) の場合、サーバ指定時間だけ待機して再試行
+      if (status === 429) {
+        if (i < MAX_RETRIES - 1) {
+          const waitMs = parseRetryWait_(resp, body);
+          console.warn(`Gemini API 429エラー。${(waitMs / 1000).toFixed(1)}秒後に再試行します... (${i + 1}/${MAX_RETRIES})`);
+          Utilities.sleep(waitMs);
+          continue;
+        }
+      }
+
       // 503エラーの場合、少し待ってから再試行する
-      if (resp.getResponseCode() === 503) {
+      if (status === 503) {
         if (i < MAX_RETRIES - 1) { // 最後の試行でなければ
           console.log(`Gemini API 503エラー。${RETRY_DELAY_MS / 1000}秒後に再試行します... (${i + 1}/${MAX_RETRIES})`);
           Utilities.sleep(RETRY_DELAY_MS);
           continue; // ループの先頭に戻って再試行
         }
       }
-      
+
       // 503以外のAPIエラー
-      if (resp.getResponseCode() !== 200) {
-        throw new Error(`Gemini API Error: ${resp.getResponseCode()} ${resp.getContentText()}`);
+      if (status !== 200) {
+        throw new Error(`Gemini API Error: ${status} ${body}`);
       }
-      
+
       // 正常に成功した場合
-      const j   = JSON.parse(resp.getContentText());
+      const j   = JSON.parse(body);
       let  out  = j.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-      if (!out) throw new Error('Gemini応答が空: ' + resp.getContentText().slice(0, 200));
+      if (!out) throw new Error('Gemini応答が空: ' + body.slice(0, 200));
 
       if (out.startsWith('```')) {
         out = out.replace(/^```[\s\S]*?\n/, '').replace(/```$/, '').trim();
@@ -252,4 +290,26 @@ function callGemini(prompt) {
       }
     }
   }
+}
+
+function parseRetryWait_(resp, body) {
+  const headers = resp.getAllHeaders && resp.getAllHeaders();
+  const retryAfter = headers && (headers['Retry-After'] || headers['retry-after']);
+  if (retryAfter) {
+    const sec = Number(retryAfter);
+    if (!Number.isNaN(sec) && sec > 0) {
+      return Math.max(1000, Math.ceil(sec * 1000));
+    }
+  }
+
+  const match = /retry in\s+([0-9.]+)s/i.exec(body || '');
+  if (match) {
+    const sec = Number(match[1]);
+    if (!Number.isNaN(sec) && sec > 0) {
+      return Math.max(1000, Math.ceil(sec * 1000));
+    }
+  }
+
+  // デフォルトは15秒待機
+  return 15000;
 }

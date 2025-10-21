@@ -12,7 +12,7 @@ const USE_MATCH_API = true; // false で従来（Gemini直叩き）へフォー�
 
 // ===== Match API endpoint =====
 const MATCH_API_BASE = 'https://match-api-650488873290.asia-northeast1.run.app/match';
-const MATCH_API_URL_INMAIL = MATCH_API_BASE + '?mode=scout';
+const MATCH_API_URL_INMAIL = MATCH_API_BASE + '?mode=inmail';
 
 // ===== Logging / Build Tag =====
 const BUILD_TAG_INMAIL = 'inMail via match-api v2025-10-21';

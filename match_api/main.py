@@ -107,14 +107,16 @@ def healthz():
 # =========================
 @app.route("/match", methods=["POST"])
 def match():
-    mode = request.args.get("mode", "scout")
+    mode = (request.args.get("mode", "scout") or "").lower()
     body = request.get_json(silent=True)
     if not body or "candidate" not in body:
         return jsonify(error="candidate required"), 400
 
     cand = body["candidate"]
     try:
-        if mode == "scout":
+        if mode == "inmail":
+            result = inmail_flow(body)
+        elif mode == "scout":
             if body.get("prompt"):
                 result = inmail_flow(body)
             else:

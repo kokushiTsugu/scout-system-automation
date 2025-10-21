@@ -115,12 +115,17 @@ def match():
     cand = body["candidate"]
     try:
         if mode == "scout":
-            result = scout_flow(cand)
+            if body.get("prompt"):
+                result = inmail_flow(body)
+            else:
+                result = scout_flow(cand)
         elif mode == "proposal":
             result = proposal_flow(cand)
         else:
             return jsonify(error="mode must be scout|proposal"), 400
         return jsonify(result), 200
+    except ValueError as ve:
+        return jsonify(error=str(ve)), 400
     except Exception as e:
         app.logger.exception("match() failed")
         return jsonify(error=str(e)), 500
@@ -237,6 +242,87 @@ def proposal_flow(cand: dict) -> Dict[str, Any]:
         app.logger.warning("Flash scoring parse error: %s …", scored_json[:200])
         scored = subset[:5]
     return {"selected_positions": scored}
+
+
+def inmail_flow(body: dict) -> Dict[str, Any]:
+    """Generate inMail content via Gemini using a pre-built prompt from GAS."""
+    prompt = body.get("prompt", "")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt required for inmail flow")
+
+    options = body.get("options") or {}
+    temperature = options.get("temperature", 0.4)
+    try:
+        temperature = float(temperature)
+    except Exception:
+        temperature = 0.4
+
+    max_output = (
+        options.get("maxOutput")
+        or options.get("max_output")
+        or options.get("max_tokens")
+        or options.get("maxTokens")
+        or 1024
+    )
+    try:
+        max_output = int(max_output)
+    except Exception:
+        max_output = 1024
+
+    raw = _gen_text_v1(prompt, MODEL_FLASH, temperature=temperature, max_tokens=max_output)
+    clean = strip_fence(raw)
+    try:
+        parsed = json.loads(clean)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"inmail JSON parse error: {clean[:200]}") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("inmail response must be a JSON object")
+
+    positions = parsed.get("positions")
+    if not isinstance(positions, list) or not positions:
+        raise RuntimeError("inmail JSON missing positions array")
+
+    sanitized_positions = []
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        sanitized_positions.append(
+            {
+                "id": str(pos.get("id") or ""),
+                "title": str(pos.get("title") or ""),
+                "company_desc": str(pos.get("company_desc") or pos.get("company") or ""),
+                "salary": str(pos.get("salary") or ""),
+                "appeal_points": (
+                    pos.get("appeal_points")
+                    if isinstance(pos.get("appeal_points"), list)
+                    else (
+                        [str(pos.get("appeal_points"))]
+                        if pos.get("appeal_points")
+                        else []
+                    )
+                ),
+            }
+        )
+
+    sanitized_positions = [p for p in sanitized_positions if any([p["title"], p["company_desc"], p["salary"], p["appeal_points"]])]
+
+    if not sanitized_positions:
+        raise RuntimeError("inmail JSON positions missing required fields")
+
+    subject = parsed.get("subject")
+    intro = parsed.get("intro_sentence") or parsed.get("intro")
+    closing = parsed.get("closing_sentence") or parsed.get("closing")
+
+    if not all(isinstance(x, str) and x.strip() for x in [subject, intro, closing]):
+        raise RuntimeError("inmail JSON missing subject/intro/closing")
+
+    return {
+        "positions": sanitized_positions,
+        "subject": subject.strip(),
+        "intro_sentence": intro.strip(),
+        "closing_sentence": closing.strip(),
+    }
 
 
 # =========================

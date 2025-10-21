@@ -7,13 +7,285 @@
  * - プロンプトを Few-shot 形式に刷新し、文章の質を向上
  * ===================================================================== */
 
+// ===== Feature toggle =====
+const USE_MATCH_API = true; // false で従来（Gemini直叩き）へフォールバック
+
+// ===== Match API endpoint =====
+const MATCH_API_BASE = 'https://match-api-650488873290.asia-northeast1.run.app/match';
+const MATCH_API_URL_INMAIL = MATCH_API_BASE + '?mode=scout';
+
+// ===== Logging / Build Tag =====
+const BUILD_TAG_INMAIL = 'inMail via match-api v2025-10-21';
+function _rid(){ return Utilities.getUuid(); }
+function _log(...args){ console.log(`[${BUILD_TAG_INMAIL}]`, ...args); }
+
 /* ===== 1. 固定値 ===== */
 const SHEET_JOBS   = 'Job_Database';
 const SHEET_CANDS  = 'Candidate_Pipeline';
 const MAX_BATCH    = 15;
 
-/* ===== 3. メイン処理 (修正版) ===== */
+const PER_ITEM_INTERVAL_MS = 1800;
+const DEADLINE_MS = 8 * 60 * 1000;
+
+function rateLimitSleep(baseMs){
+  const jitter = Math.floor(Math.random() * 400); // 0〜399ms → 1.8〜2.2秒程度
+  Utilities.sleep(baseMs + jitter);
+}
+
+function createWatchdog(){
+  const start = Date.now();
+  return function guard(){
+    if (Date.now() - start > DEADLINE_MS) {
+      throw new Error('timeout watchdog');
+    }
+  };
+}
+
+function withScriptLock(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+// テスト手順メモ:
+// 1. 対象配列を 1 件に絞り単発実行 → RID/ログを Apps Script Executions で確認。
+// 2. 問題なければ 5 件 → 10 件と段階的に拡大（処理間隔は自動で 1.8〜2.2 秒）。
+// 3. 必要に応じて PER_ITEM_INTERVAL_MS を 2000 などへ調整してリリース。
+
+function postMatchApiWithBackoff(url, payload, headers, maxRetries = 6) {
+  let attempt = 0;
+  while (true) {
+    const res = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      headers,
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+    const code = res.getResponseCode();
+    const body = res.getContentText();
+
+    if (code === 200) return JSON.parse(body || '{}');
+
+    if (code === 429) {
+      const headerSource = res.getAllHeaders ? res.getAllHeaders() : (res.getHeaders ? res.getHeaders() : null);
+      const retryHeader = headerSource && (headerSource['Retry-After'] || headerSource['retry-after']);
+      let ms = retryHeader ? Math.ceil(parseFloat(retryHeader) * 1000) : 0;
+      if (!ms) {
+        const m = body.match(/retry in ([\d.]+)s/i);
+        if (m) ms = Math.ceil(parseFloat(m[1]) * 1000);
+      }
+      if (!ms) ms = Math.min(30000, 500 * Math.pow(2, attempt));
+      _log(`429 -> sleep ${ms}ms (attempt=${attempt})`);
+      Utilities.sleep(ms);
+    } else if (code >= 500 && code < 600) {
+      if (attempt >= maxRetries) throw new Error(`match-api 5xx(${code}) after retries: ${body}`);
+      const ms = Math.min(30000, 500 * Math.pow(2, attempt));
+      _log(`5xx(${code}) -> sleep ${ms}ms (attempt=${attempt})`);
+      Utilities.sleep(ms);
+    } else {
+      _log('error resp', String(body).slice(0, 500));
+      throw new Error(`match-api Error ${code}: ${body}`);
+    }
+    attempt++;
+    if (attempt > maxRetries) throw new Error(`match-api Retry exceeded: ${body}`);
+  }
+}
+
+function adaptMatchApiInMailResponse(res){
+  if (res == null) throw new Error('match-api empty response');
+
+  let rawText = '';
+  let payload = null;
+
+  const trySetFrom = value => {
+    if (value == null) return false;
+    if (typeof value === 'string') {
+      rawText = value.trim();
+      try {
+        payload = JSON.parse(rawText);
+      } catch (e) {
+        // ignore JSON parse failure; keep rawText for caller
+      }
+      return true;
+    }
+    if (typeof value === 'object') {
+      payload = value;
+      rawText = JSON.stringify(value);
+      return true;
+    }
+    return false;
+  };
+
+  if (typeof res === 'string') {
+    trySetFrom(res);
+  } else if (typeof res === 'object') {
+    const order = [
+      res.result?.json,
+      res.result?.text,
+      res.result?.body,
+      res.response?.json,
+      res.response?.text,
+      res.data,
+      res.raw,
+      res.text,
+    ];
+    for (const candidate of order) {
+      if (trySetFrom(candidate)) break;
+    }
+    if (!rawText && !payload) {
+      if (!trySetFrom(res)) {
+        trySetFrom(res.result);
+      }
+    }
+  }
+
+  if (!rawText) {
+    if (payload) {
+      rawText = JSON.stringify(payload);
+    } else {
+      throw new Error('match-api response missing text payload');
+    }
+  }
+
+  if (!payload) {
+    try {
+      payload = JSON.parse(rawText);
+    } catch (e) {
+      throw new Error('match-api response is not valid JSON');
+    }
+  }
+
+  return { rawText, payload };
+}
+
+function normalizeInMailPayload(payload, rawText) {
+  const seen = [];
+  const queue = [];
+
+  const enqueue = value => {
+    if (value == null) return;
+    queue.push(value);
+  };
+
+  const parseString = text => {
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return null;
+    const withoutFence = trimmed.startsWith('```')
+      ? trimmed.replace(/^```[a-zA-Z0-9_+-]*\n?/, '').replace(/```$/, '').trim()
+      : trimmed;
+    try {
+      return JSON.parse(withoutFence);
+    } catch (e) {
+      return null;
+    }
+  };
+
+  const convertSelectedToInMail = obj => {
+    if (!obj || typeof obj !== 'object') return null;
+    const selected = Array.isArray(obj.selected_positions) ? obj.selected_positions : null;
+    if (!selected || !selected.length) return null;
+
+    const pick = keys => {
+      for (const key of keys) {
+        const val = obj[key];
+        if (typeof val === 'string' && val.trim()) return val.trim();
+      }
+      return '';
+    };
+
+    const subject = pick(['subject', 'inmail_subject']);
+    const intro = pick(['intro_sentence', 'inmail_intro', 'intro']);
+    const closing = pick(['closing_sentence', 'inmail_closing', 'closing']);
+
+    const positions = selected.map(p => ({
+      id: String(p?.id || p?.job_id || ''),
+      title: String(p?.title || p?.job_title || ''),
+      company_desc: String(p?.company_desc || p?.company || ''),
+      salary: String(p?.salary || p?.annual_salary || ''),
+      appeal_points: Array.isArray(p?.appeal_points)
+        ? p.appeal_points
+        : (p?.appeal_points ? [String(p.appeal_points)] : []),
+    })).filter(pos => pos.title || pos.company_desc || pos.salary || pos.appeal_points.length);
+
+    if (positions.length && subject && intro && closing) {
+      return {
+        positions,
+        subject,
+        intro_sentence: intro,
+        closing_sentence: closing,
+      };
+    }
+    return null;
+  };
+
+  enqueue(payload);
+  enqueue(rawText);
+
+  while (queue.length) {
+    const current = queue.shift();
+    let obj = null;
+
+    if (typeof current === 'string') {
+      obj = parseString(current);
+      if (!obj) continue;
+    } else if (typeof current === 'object') {
+      if (seen.indexOf(current) >= 0) continue;
+      seen.push(current);
+      obj = current;
+    } else {
+      continue;
+    }
+
+    if (!obj || typeof obj !== 'object') continue;
+
+    if (Array.isArray(obj.positions) && obj.positions.length) {
+      return obj;
+    }
+
+    const converted = convertSelectedToInMail(obj);
+    if (converted) return converted;
+
+    const nestedKeys = ['result', 'data', 'payload', 'response', 'friend_request_note', 'note', 'body', 'text', 'json', 'message', 'raw'];
+    for (const key of nestedKeys) {
+      if (obj[key] != null) {
+        enqueue(obj[key]);
+      }
+    }
+  }
+
+  return null;
+}
+
 function runBatchScoutMatching() {
+  return withScriptLock(() => _runBatchScoutMatching());
+}
+
+/* ===== 2. 補助ユーティリティ ===== */
+function compactJobCatalog(jobs) {
+  const squeeze = (txt, limit) => {
+    if (!txt) return '';
+    const flat = String(txt).replace(/[\s\u3000]+/g, ' ').trim();
+    if (!limit) return flat;
+    return flat.length <= limit ? flat : flat.slice(0, limit - 1) + '…';
+  };
+
+  return jobs.map(job => ({
+    id      : job.id,
+    company : job.company,
+    title   : job.title,
+    salary  : squeeze(job.salary, 60),
+    summary : squeeze(job.summary, 280),
+    location: squeeze(job.location, 60),
+    must    : squeeze(job.must, 220),
+    plus    : squeeze(job.plus, 180),
+    person  : squeeze(job.person, 120),
+    appeal  : squeeze(job.appeal, 160),
+  }));
+}
+
+/* ===== 3. メイン処理 (修正版) ===== */
+function _runBatchScoutMatching() {
   const ui        = SpreadsheetApp.getUi();
   const ss        = SpreadsheetApp.getActiveSpreadsheet();
   const jobSheet  = ss.getSheetByName(SHEET_JOBS);
@@ -41,11 +313,19 @@ function runBatchScoutMatching() {
     return;
   }
 
+  const compactCatalog = compactJobCatalog(jobJson);
+  const jobCatalogPayload = JSON.stringify(compactCatalog);
+
   /* 3-2. 候補者ループ */
   const rows    = candSheet.getDataRange().getValues();
   let   handled = 0;
+  const RID = _rid();
+  const guard = createWatchdog();
+
+  _log('start', { RID, jobs: jobJson.length, rows: rows.length });
 
   for (let i = 1; i < rows.length && handled < MAX_BATCH; i++) {
+    guard();
     if (rows[i][2]) continue;
     const rowIdx = i + 1;
     try {
@@ -57,9 +337,58 @@ function runBatchScoutMatching() {
       // ★ 姓名の間のスペースで分割し、姓を取得
       const lastName = fullName.split(/[\\s　]/)[0]; // ← 変数は残してOK
 
-      const prompt  = buildPrompt('{姓}', profile, JSON.stringify(jobJson, null, 2));
-      const aiText  = callGemini(prompt);
-      const data    = JSON.parse(aiText);
+      const prompt  = buildPrompt('{姓}', profile, jobCatalogPayload);
+      let aiText;
+      let data;
+
+      if (USE_MATCH_API) {
+        const headers = {};
+        const body = {
+          rid: RID,
+          prompt,
+          candidate: {
+            name: fullName,
+            last_name: lastName,
+            profile,
+          },
+          jobCatalog: compactCatalog,
+          options: { locale: 'ja-JP', maxOutput: 1024, temperature: 0.4 },
+        };
+        _log('request keys', Object.keys(body));
+        const json = postMatchApiWithBackoff(MATCH_API_URL_INMAIL, body, headers, 6);
+        const adapted = adaptMatchApiInMailResponse(json);
+        const normalized = normalizeInMailPayload(adapted.payload, adapted.rawText);
+        const rootKeys = adapted.payload && typeof adapted.payload === 'object'
+          ? Object.keys(adapted.payload)
+          : [];
+        if (!normalized || !Array.isArray(normalized.positions) || !normalized.positions.length) {
+          throw new Error(`match-api payload missing positions (rootKeys=${rootKeys.join(',') || 'none'})`);
+        }
+        const safePositions = normalized.positions.map(p => ({
+          id: p?.id || '',
+          title: p?.title || '',
+          company_desc: p?.company_desc || p?.company || '',
+          salary: p?.salary || '',
+          appeal_points: Array.isArray(p?.appeal_points) ? p.appeal_points : [],
+        }));
+        const subject = typeof normalized.subject === 'string' ? normalized.subject : '';
+        const intro = typeof normalized.intro_sentence === 'string' ? normalized.intro_sentence : '';
+        const closing = typeof normalized.closing_sentence === 'string' ? normalized.closing_sentence : '';
+        if (!subject || !intro || !closing) {
+          throw new Error(`match-api payload missing text fields (subject=${!!subject}, intro=${!!intro}, closing=${!!closing})`);
+        }
+        const sanitized = {
+          positions: safePositions,
+          subject,
+          intro_sentence: intro,
+          closing_sentence: closing,
+        };
+        aiText = JSON.stringify(sanitized);
+        data = sanitized;
+      } else {
+        aiText  = callGemini(prompt);
+        data    = JSON.parse(aiText);
+      }
 
       /* 3-3. 本文パーツ整形 & 生成 */
 
@@ -114,9 +443,14 @@ ${YOUR_NAME} ｜${YOUR_COMPANY}`; // ← 署名のスペースを調整
     } catch (err) {
       candSheet.getRange(rowIdx, 3).setValue('エラー');
       candSheet.getRange(rowIdx, 7).setValue(String(err).slice(0, 500));
+      _log('error', { RID, row: rowIdx, message: String(err).slice(0, 200) });
     }
     handled++;
+    if (USE_MATCH_API && i < rows.length - 1 && handled < MAX_BATCH) {
+      rateLimitSleep(PER_ITEM_INTERVAL_MS);
+    }
   }
+  _log('finish', { RID, handled });
   ui.alert(`今回 ${handled} 名を処理しました。`);
 }
 
@@ -219,24 +553,37 @@ function callGemini(prompt) {
         muteHttpExceptions: true,
       });
 
+      const status = resp.getResponseCode();
+      const body   = resp.getContentText();
+
+      // 429 (rate limit) の場合、サーバ指定時間だけ待機して再試行
+      if (status === 429) {
+        if (i < MAX_RETRIES - 1) {
+          const waitMs = parseRetryWait_(resp, body);
+          console.warn(`Gemini API 429エラー。${(waitMs / 1000).toFixed(1)}秒後に再試行します... (${i + 1}/${MAX_RETRIES})`);
+          Utilities.sleep(waitMs);
+          continue;
+        }
+      }
+
       // 503エラーの場合、少し待ってから再試行する
-      if (resp.getResponseCode() === 503) {
+      if (status === 503) {
         if (i < MAX_RETRIES - 1) { // 最後の試行でなければ
           console.log(`Gemini API 503エラー。${RETRY_DELAY_MS / 1000}秒後に再試行します... (${i + 1}/${MAX_RETRIES})`);
           Utilities.sleep(RETRY_DELAY_MS);
           continue; // ループの先頭に戻って再試行
         }
       }
-      
+
       // 503以外のAPIエラー
-      if (resp.getResponseCode() !== 200) {
-        throw new Error(`Gemini API Error: ${resp.getResponseCode()} ${resp.getContentText()}`);
+      if (status !== 200) {
+        throw new Error(`Gemini API Error: ${status} ${body}`);
       }
-      
+
       // 正常に成功した場合
-      const j   = JSON.parse(resp.getContentText());
+      const j   = JSON.parse(body);
       let  out  = j.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-      if (!out) throw new Error('Gemini応答が空: ' + resp.getContentText().slice(0, 200));
+      if (!out) throw new Error('Gemini応答が空: ' + body.slice(0, 200));
 
       if (out.startsWith('```')) {
         out = out.replace(/^```[\s\S]*?\n/, '').replace(/```$/, '').trim();
@@ -252,4 +599,26 @@ function callGemini(prompt) {
       }
     }
   }
+}
+
+function parseRetryWait_(resp, body) {
+  const headers = resp.getAllHeaders && resp.getAllHeaders();
+  const retryAfter = headers && (headers['Retry-After'] || headers['retry-after']);
+  if (retryAfter) {
+    const sec = Number(retryAfter);
+    if (!Number.isNaN(sec) && sec > 0) {
+      return Math.max(1000, Math.ceil(sec * 1000));
+    }
+  }
+
+  const match = /retry in\s+([0-9.]+)s/i.exec(body || '');
+  if (match) {
+    const sec = Number(match[1]);
+    if (!Number.isNaN(sec) && sec > 0) {
+      return Math.max(1000, Math.ceil(sec * 1000));
+    }
+  }
+
+  // デフォルトは15秒待機
+  return 15000;
 }

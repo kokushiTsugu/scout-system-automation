@@ -159,6 +159,53 @@ function adaptMatchApiInMailResponse(res){
   return { rawText, payload };
 }
 
+function normalizeInMailPayload(payload, rawText) {
+  const tryParse = value => {
+    if (!value) return null;
+    if (typeof value === 'string') {
+      try {
+        return JSON.parse(value);
+      } catch (e) {
+        return null;
+      }
+    }
+    if (typeof value === 'object') return value;
+    return null;
+  };
+
+  const visit = value => {
+    const obj = tryParse(value);
+    if (!obj || typeof obj !== 'object') return null;
+    if (Array.isArray(obj.positions) && obj.positions.length) return obj;
+
+    const nestedKeys = ['result', 'data', 'payload', 'response'];
+    for (const key of nestedKeys) {
+      if (obj[key] != null) {
+        const nested = visit(obj[key]);
+        if (nested) return nested;
+      }
+    }
+
+    const textCandidate = obj.text || obj.json || obj.body;
+    if (textCandidate) {
+      const nested = visit(textCandidate);
+      if (nested) return nested;
+    }
+
+    return null;
+  };
+
+  const direct = visit(payload);
+  if (direct) return direct;
+
+  if (rawText) {
+    const fromRaw = visit(rawText);
+    if (fromRaw) return fromRaw;
+  }
+
+  return null;
+}
+
 function runBatchScoutMatching() {
   return withScriptLock(() => _runBatchScoutMatching());
 }
@@ -259,8 +306,34 @@ function _runBatchScoutMatching() {
         _log('request keys', Object.keys(body));
         const json = postMatchApiWithBackoff(MATCH_API_URL_INMAIL, body, headers, 6);
         const adapted = adaptMatchApiInMailResponse(json);
-        aiText = adapted.rawText;
-        data = adapted.payload;
+        const normalized = normalizeInMailPayload(adapted.payload, adapted.rawText);
+        const rootKeys = adapted.payload && typeof adapted.payload === 'object'
+          ? Object.keys(adapted.payload)
+          : [];
+        if (!normalized || !Array.isArray(normalized.positions) || !normalized.positions.length) {
+          throw new Error(`match-api payload missing positions (rootKeys=${rootKeys.join(',') || 'none'})`);
+        }
+        const safePositions = normalized.positions.map(p => ({
+          id: p?.id || '',
+          title: p?.title || '',
+          company_desc: p?.company_desc || p?.company || '',
+          salary: p?.salary || '',
+          appeal_points: Array.isArray(p?.appeal_points) ? p.appeal_points : [],
+        }));
+        const subject = typeof normalized.subject === 'string' ? normalized.subject : '';
+        const intro = typeof normalized.intro_sentence === 'string' ? normalized.intro_sentence : '';
+        const closing = typeof normalized.closing_sentence === 'string' ? normalized.closing_sentence : '';
+        if (!subject || !intro || !closing) {
+          throw new Error(`match-api payload missing text fields (subject=${!!subject}, intro=${!!intro}, closing=${!!closing})`);
+        }
+        const sanitized = {
+          positions: safePositions,
+          subject,
+          intro_sentence: intro,
+          closing_sentence: closing,
+        };
+        aiText = JSON.stringify(sanitized);
+        data = sanitized;
       } else {
         aiText  = callGemini(prompt);
         data    = JSON.parse(aiText);

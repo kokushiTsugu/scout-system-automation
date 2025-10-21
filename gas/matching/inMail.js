@@ -160,47 +160,98 @@ function adaptMatchApiInMailResponse(res){
 }
 
 function normalizeInMailPayload(payload, rawText) {
-  const tryParse = value => {
-    if (!value) return null;
-    if (typeof value === 'string') {
-      try {
-        return JSON.parse(value);
-      } catch (e) {
-        return null;
-      }
+  const seen = [];
+  const queue = [];
+
+  const enqueue = value => {
+    if (value == null) return;
+    queue.push(value);
+  };
+
+  const parseString = text => {
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return null;
+    const withoutFence = trimmed.startsWith('```')
+      ? trimmed.replace(/^```[a-zA-Z0-9_+-]*\n?/, '').replace(/```$/, '').trim()
+      : trimmed;
+    try {
+      return JSON.parse(withoutFence);
+    } catch (e) {
+      return null;
     }
-    if (typeof value === 'object') return value;
+  };
+
+  const convertSelectedToInMail = obj => {
+    if (!obj || typeof obj !== 'object') return null;
+    const selected = Array.isArray(obj.selected_positions) ? obj.selected_positions : null;
+    if (!selected || !selected.length) return null;
+
+    const pick = keys => {
+      for (const key of keys) {
+        const val = obj[key];
+        if (typeof val === 'string' && val.trim()) return val.trim();
+      }
+      return '';
+    };
+
+    const subject = pick(['subject', 'inmail_subject']);
+    const intro = pick(['intro_sentence', 'inmail_intro', 'intro']);
+    const closing = pick(['closing_sentence', 'inmail_closing', 'closing']);
+
+    const positions = selected.map(p => ({
+      id: String(p?.id || p?.job_id || ''),
+      title: String(p?.title || p?.job_title || ''),
+      company_desc: String(p?.company_desc || p?.company || ''),
+      salary: String(p?.salary || p?.annual_salary || ''),
+      appeal_points: Array.isArray(p?.appeal_points)
+        ? p.appeal_points
+        : (p?.appeal_points ? [String(p.appeal_points)] : []),
+    })).filter(pos => pos.title || pos.company_desc || pos.salary || pos.appeal_points.length);
+
+    if (positions.length && subject && intro && closing) {
+      return {
+        positions,
+        subject,
+        intro_sentence: intro,
+        closing_sentence: closing,
+      };
+    }
     return null;
   };
 
-  const visit = value => {
-    const obj = tryParse(value);
-    if (!obj || typeof obj !== 'object') return null;
-    if (Array.isArray(obj.positions) && obj.positions.length) return obj;
+  enqueue(payload);
+  enqueue(rawText);
 
-    const nestedKeys = ['result', 'data', 'payload', 'response'];
+  while (queue.length) {
+    const current = queue.shift();
+    let obj = null;
+
+    if (typeof current === 'string') {
+      obj = parseString(current);
+      if (!obj) continue;
+    } else if (typeof current === 'object') {
+      if (seen.indexOf(current) >= 0) continue;
+      seen.push(current);
+      obj = current;
+    } else {
+      continue;
+    }
+
+    if (!obj || typeof obj !== 'object') continue;
+
+    if (Array.isArray(obj.positions) && obj.positions.length) {
+      return obj;
+    }
+
+    const converted = convertSelectedToInMail(obj);
+    if (converted) return converted;
+
+    const nestedKeys = ['result', 'data', 'payload', 'response', 'friend_request_note', 'note', 'body', 'text', 'json', 'message', 'raw'];
     for (const key of nestedKeys) {
       if (obj[key] != null) {
-        const nested = visit(obj[key]);
-        if (nested) return nested;
+        enqueue(obj[key]);
       }
     }
-
-    const textCandidate = obj.text || obj.json || obj.body;
-    if (textCandidate) {
-      const nested = visit(textCandidate);
-      if (nested) return nested;
-    }
-
-    return null;
-  };
-
-  const direct = visit(payload);
-  if (direct) return direct;
-
-  if (rawText) {
-    const fromRaw = visit(rawText);
-    if (fromRaw) return fromRaw;
   }
 
   return null;

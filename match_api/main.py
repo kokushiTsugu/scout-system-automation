@@ -599,10 +599,21 @@ def _gen_text_v1(
         candidates.append(MODEL_FLASH)
     try:
         picked = _pick_model_for_generate()
-        if picked not in candidates:
+        if picked and picked not in candidates:
             candidates.append(picked)
     except Exception as e:
         print(f"[MODELS] pick failed: {e}")
+
+    try:
+        for mdl in _list_models_v1():
+            name = (mdl.get("name", "") or "").split("/")[-1]
+            if not name or name in candidates:
+                continue
+            methods = mdl.get("supportedGenerationMethods") or []
+            if "generateContent" in methods:
+                candidates.append(name)
+    except Exception as e:
+        print(f"[MODELS] list failed: {e}")
 
     for b in [
         "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro",
@@ -685,7 +696,9 @@ def _gen_text_v1(
                 break
         else:
             continue
-    raise RuntimeError(f"REST v1 generateContent failed. last={last}; tried={candidates}")
+    raise RuntimeError(
+        f"REST v1 generateContent failed. last={last}; tried={candidates}"
+    )
 
 
 # =========================

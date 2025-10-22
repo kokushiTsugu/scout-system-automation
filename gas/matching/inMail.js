@@ -31,10 +31,86 @@ const MAX_BATCH    = 15;
 
 const PER_ITEM_INTERVAL_MS = 1800;
 const DEADLINE_MS = 8 * 60 * 1000;
+const PROFILE_MAX_CHARS = 6000;
+const JOB_CATALOG_MAX_JOBS = 40;
+const JOB_CATALOG_MAX_CHARS = 60000;
 
 function rateLimitSleep(baseMs){
   const jitter = Math.floor(Math.random() * 400); // 0〜399ms → 1.8〜2.2秒程度
   Utilities.sleep(baseMs + jitter);
+}
+
+function clampText(value, maxChars) {
+  const text = String(value == null ? '' : value);
+  if (!maxChars || text.length <= maxChars) return text;
+  return text.slice(0, Math.max(0, maxChars - 1)) + '…';
+}
+
+function normalizeProfileText(profile) {
+  const original = String(profile == null ? '' : profile);
+  const normalized = original
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u3000\t]+/g, ' ')
+    .trim();
+  const clamped = clampText(normalized, PROFILE_MAX_CHARS);
+  return {
+    text: clamped,
+    truncated: normalized.length > PROFILE_MAX_CHARS,
+    originalLength: original.length,
+    normalizedLength: normalized.length,
+  };
+}
+
+function shrinkJobForPrompt(job, perFieldLimit) {
+  const limit = perFieldLimit || 400;
+  const result = {};
+  Object.keys(job || {}).forEach(key => {
+    const value = job[key];
+    if (typeof value === 'string') {
+      result[key] = clampText(value, limit);
+    } else if (Array.isArray(value)) {
+      result[key] = value.slice(0, 4).map(item => (
+        typeof item === 'string' ? clampText(item, Math.floor(limit / 2)) : item
+      ));
+    } else {
+      result[key] = value;
+    }
+  });
+  return result;
+}
+
+function prepareCatalogForPrompt(catalog) {
+  const maxJobs = JOB_CATALOG_MAX_JOBS;
+  const maxChars = JOB_CATALOG_MAX_CHARS;
+  const subset = catalog.slice(0, maxJobs);
+  let truncated = subset.length < catalog.length;
+  let arrayForPrompt = subset.map(job => Object.assign({}, job));
+  let payload = JSON.stringify(arrayForPrompt);
+
+  if (payload.length > maxChars) {
+    arrayForPrompt = subset.map(job => shrinkJobForPrompt(job, 320));
+    payload = JSON.stringify(arrayForPrompt);
+    truncated = true;
+  }
+
+  while (payload.length > maxChars && arrayForPrompt.length > 1) {
+    arrayForPrompt.pop();
+    payload = JSON.stringify(arrayForPrompt);
+    truncated = true;
+  }
+
+  if (payload.length > maxChars && arrayForPrompt.length === 1) {
+    arrayForPrompt = [shrinkJobForPrompt(arrayForPrompt[0], 200)];
+    payload = JSON.stringify(arrayForPrompt);
+  }
+
+  return {
+    list: arrayForPrompt,
+    payload,
+    truncated,
+    kept: arrayForPrompt.length,
+    approxChars: payload.length,
+  };
 }
 
 function createWatchdog(){
@@ -319,7 +395,9 @@ function _runBatchScoutMatching() {
   }
 
   const compactCatalog = compactJobCatalog(jobJson);
-  const jobCatalogPayload = JSON.stringify(compactCatalog);
+  const catalogForPrompt = prepareCatalogForPrompt(compactCatalog);
+  const jobCatalogPayload = catalogForPrompt.payload;
+  const jobCatalogForApi = catalogForPrompt.list;
 
   /* 3-2. 候補者ループ */
   const rows    = candSheet.getDataRange().getValues();
@@ -327,7 +405,10 @@ function _runBatchScoutMatching() {
   const RID = _rid();
   const guard = createWatchdog();
 
-  _log('start', { RID, jobs: jobJson.length, rows: rows.length });
+  _log('start', { RID, jobs: jobJson.length, rows: rows.length, promptJobs: jobCatalogForApi.length, catalogChars: jobCatalogPayload.length });
+  if (catalogForPrompt.truncated) {
+    _log('catalog truncated', { RID, kept: catalogForPrompt.kept, total: compactCatalog.length, approxChars: catalogForPrompt.approxChars });
+  }
 
   for (let i = 1; i < rows.length && handled < MAX_BATCH; i++) {
     guard();
@@ -342,7 +423,25 @@ function _runBatchScoutMatching() {
       // ★ 姓名の間のスペースで分割し、姓を取得
       const lastName = fullName.split(/[\\s　]/)[0]; // ← 変数は残してOK
 
-      const prompt  = buildPrompt('{姓}', profile, jobCatalogPayload);
+      const profileMeta = normalizeProfileText(profile);
+      const profileForPrompt = profileMeta.text;
+      if (profileMeta.truncated) {
+        _log('profile truncated', {
+          RID,
+          row: rowIdx,
+          originalChars: profileMeta.originalLength,
+          normalizedChars: profileMeta.normalizedLength,
+          keptChars: profileForPrompt.length,
+        });
+      }
+      const prompt  = buildPrompt('{姓}', profileForPrompt, jobCatalogPayload);
+      _log('prompt stats', {
+        RID,
+        row: rowIdx,
+        promptChars: prompt.length,
+        profileChars: profileForPrompt.length,
+        catalogChars: jobCatalogPayload.length,
+      });
       let aiText;
       let data;
 
@@ -354,9 +453,9 @@ function _runBatchScoutMatching() {
           candidate: {
             name: fullName,
             last_name: lastName,
-            profile,
+            profile: profileForPrompt,
           },
-          jobCatalog: compactCatalog,
+          jobCatalog: jobCatalogForApi,
           options: { locale: 'ja-JP', maxOutput: 1024, temperature: 0.4 },
         };
         _log('request keys', Object.keys(body));

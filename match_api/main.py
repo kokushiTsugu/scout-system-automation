@@ -91,6 +91,12 @@ def strip_fence(txt: str) -> str:
         s = s.split("```", 1)[1]
         if "```" in s:
             s = s.rsplit("```", 1)[0]
+    s = s.strip()
+    lowered = s.lower()
+    if lowered.startswith("json"):
+        remainder = s[4:]
+        if not remainder or remainder[0].isspace() or remainder[0] in "[{":
+            s = remainder.lstrip()
     return s.strip()
 
 
